@@ -502,13 +502,16 @@ class TelegramBot {
       }
 
       // Keyboard buttons
-      if (text === '👛 Wallet') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/wallet' } });
-      if (text === '📊 Positions') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/positions' } });
-      if (text === '💰 PnL') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/pnl' } });
-      if (text === '🎴 Card') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/card' } });
-      if (text === '📋 Menu') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/menu' } });
-      if (text.startsWith('🔗')) return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/chain' } });
-      if (text === '⚙️ Settings') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/settings' } });
+      const BUTTONS = {
+        '👛 Wallet': 'wallet',
+        '📊 Positions': 'positions',
+        '💰 PnL': 'pnl',
+        '🎴 Card': 'card',
+        '📋 Menu': 'menu',
+        '⚙️ Settings': 'settings',
+      };
+      const command = BUTTONS[text] || (text.startsWith('🔗') ? 'chain' : null);
+      if (command) return this._runCommand(ctx, command);
     });
 
     // === ALERTS ===
@@ -818,6 +821,26 @@ class TelegramBot {
       ctx.replyWithHTML('⚠️ <b>Show private key?</b>', Markup.inlineKeyboard([
         [Markup.button.callback('Yes', 'confirm_export'), Markup.button.callback('Cancel', 'cancel_action')],
       ]));
+    });
+  }
+
+  /**
+   * Run a slash command on behalf of a reply-keyboard button.
+   *
+   * Telegraf matches bot.command() on a `bot_command` message entity, not on
+   * the text. A keyboard button sends plain text with no entities, so
+   * re-dispatching with only the text swapped matched nothing and the button
+   * silently did nothing. The entity has to be synthesized too.
+   */
+  _runCommand(ctx, command) {
+    const text = `/${command}`;
+    return this.bot.handleUpdate({
+      ...ctx.update,
+      message: {
+        ...ctx.message,
+        text,
+        entities: [{ type: 'bot_command', offset: 0, length: text.length }],
+      },
     });
   }
 
