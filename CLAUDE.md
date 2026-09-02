@@ -90,6 +90,17 @@ The alerter additionally refuses to send anything below 50% confidence.
   1 attempt there; leaving it at the default made a single 429 block the caller
   for minutes and surface as "exceeded maximum retry limit".
   Set `ROBINHOOD_RPC_URL` to a private endpoint to avoid the limits entirely.
+- **Pool detection prefers WebSockets.** With `ROBINHOOD_WS_URL` set (or
+  derivable from `ROBINHOOD_RPC_URL`), `ReconnectingLogWatcher` subscribes to
+  V4 `Initialize` events and the chain pushes them as they land — near-instant
+  and free of polling requests. Without one it falls back to HTTP polling and
+  is up to one interval late on every pool.
+  Two non-obvious constraints in that watcher, both of which crashed the
+  process before they were handled: ethers assigns its own socket handlers, so
+  ours must chain onto them rather than replace them (replacing them silently
+  kills the message pump); and `provider.destroy()` rejects pending
+  `eth_subscribe` payloads that no reachable handler owns, so teardown closes
+  the socket directly instead.
 - Market data is DexScreener's free endpoint. Robinhood Chain is **not indexed
   there**, so EVM tokens score on on-chain signals only and lean on the
   confidence shrinkage above.

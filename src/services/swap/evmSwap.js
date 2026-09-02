@@ -1,7 +1,7 @@
 const { ethers } = require('ethers');
 const logger = require('../../utils/logger');
 const CHAINS = require('../chains');
-const { getEvmProvider } = require('../evmProvider');
+const { getEvmProvider, getEvmWsUrl, ReconnectingLogWatcher } = require('../evmProvider');
 
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
@@ -267,21 +267,49 @@ class EvmSwapAdapter {
     }
   }
 
+  /**
+   * Watch for new V4 pools. Prefers a WebSocket subscription — the chain pushes
+   * events the moment they land, so detection is near-instant and costs no
+   * polling requests. Falls back to HTTP polling when no WebSocket endpoint is
+   * configured (the public RPC has none), which is correct but up to one
+   * polling interval late on every pool.
+   */
   onNewPool(callback) {
+    const handler = async (id, currency0, currency1, fee, tickSpacing, hooks) => {
+      const weth = this.config.weth.toLowerCase();
+      const c0 = currency0.toLowerCase();
+      const c1 = currency1.toLowerCase();
+      if (c0 !== weth && c1 !== weth) return;
+      const tokenAddress = c0 === weth ? currency1 : currency0;
+      await callback({ tokenAddress, poolId: id, fee: Number(fee), hooks });
+    };
+
+    const wsUrl = getEvmWsUrl(this.config);
+    if (wsUrl) {
+      this.poolWatcher = new ReconnectingLogWatcher({
+        wsUrl,
+        chainId: this.config.chainId,
+        address: this.config.poolManager,
+        abi: POOL_MANAGER_ABI,
+        event: 'Initialize',
+        onEvent: handler,
+        label: 'rh',
+      });
+      this.poolWatcher.start();
+      return;
+    }
+
     const poolManager = new ethers.Contract(this.config.poolManager, POOL_MANAGER_ABI, this.provider);
-    poolManager.on('Initialize', async (id, currency0, currency1, fee, tickSpacing, hooks) => {
-      try {
-        const weth = this.config.weth.toLowerCase();
-        const c0 = currency0.toLowerCase();
-        const c1 = currency1.toLowerCase();
-        if (c0 !== weth && c1 !== weth) return;
-        const tokenAddress = c0 === weth ? currency1 : currency0;
-        await callback({ tokenAddress, poolId: id, fee: Number(fee), hooks });
-      } catch (err) {
-        logger.error(`[rh] pool handler: ${err.message}`);
-      }
+    poolManager.on('Initialize', (...args) => {
+      handler(...args).catch(err => logger.error(`[rh] pool handler: ${err.message}`));
     });
-    logger.info('[rh] listening for V4 pool Initialize events');
+    this.poolContract = poolManager;
+    logger.warn('[rh] no websocket endpoint — falling back to HTTP polling for pool detection');
+  }
+
+  stopWatching() {
+    this.poolWatcher?.stop();
+    try { this.poolContract?.removeAllListeners(); } catch { /* already gone */ }
   }
 }
 

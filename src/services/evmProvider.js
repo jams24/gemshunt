@@ -172,4 +172,170 @@ function getEvmProvider(chainConfig) {
   return provider;
 }
 
-module.exports = { getEvmProvider, ThrottledProvider, isRateLimit };
+/**
+ * Resolves the WebSocket URL for a chain: explicit env var, else derived from
+ * the HTTP endpoint. Returns null when only the public RPC is configured —
+ * it does not offer WebSockets, so callers fall back to polling.
+ */
+function getEvmWsUrl(chainConfig) {
+  if (process.env.ROBINHOOD_WS_URL) return process.env.ROBINHOOD_WS_URL;
+
+  const http = process.env.ROBINHOOD_RPC_URL;
+  if (http) return http.replace(/^http/, 'ws');
+
+  // The public endpoint's advertised wsUrl is not usable for subscriptions.
+  return null;
+}
+
+/**
+ * A log subscription that survives disconnects.
+ *
+ * Ethers' WebSocketProvider does not reconnect on its own: when the socket
+ * drops, the subscription is simply gone and the bot goes silently deaf —
+ * which is worse than polling, because nothing errors. This owns the socket,
+ * detects death, and rebuilds provider + listener with backoff.
+ */
+class ReconnectingLogWatcher {
+  constructor({ wsUrl, chainId, address, abi, event, onEvent, label = 'evm' }) {
+    Object.assign(this, { wsUrl, chainId, address, abi, event, onEvent, label });
+    this.provider = null;
+    this.contract = null;
+    this.stopped = false;
+    this.attempt = 0;
+    this.heartbeat = null;
+    this.lastBlockAt = 0;
+  }
+
+  async start() {
+    this.stopped = false;
+    await this._connect();
+  }
+
+  async _connect() {
+    if (this.stopped) return;
+    try {
+      this.provider = new ethers.WebSocketProvider(this.wsUrl, this.chainId, { staticNetwork: true });
+      this.contract = new ethers.Contract(this.address, this.abi, this.provider);
+
+      // ethers' .on() returns a promise for the eth_subscribe round-trip.
+      // Destroying the provider rejects any still-pending one, so every
+      // subscribe here must carry its own catch — an unhandled rejection from
+      // a socket that died mid-handshake would otherwise crash the process.
+      const subscribed = this.contract.on(this.event, (...args) => {
+        this.lastBlockAt = Date.now();
+        Promise.resolve(this.onEvent(...args)).catch(err =>
+          logger.error(`[${this.label}] event handler: ${err.message}`)
+        );
+      });
+      subscribed.catch(() => {}); // handled below; this only marks it as observed
+      await subscribed;
+
+      // Liveness: a silent socket is indistinguishable from a quiet chain
+      // unless we watch block arrivals. Robinhood blocks are ~250ms, so a
+      // 90s gap means the socket is dead even if it never emitted an error.
+      this.lastBlockAt = Date.now();
+      this.provider.on('block', () => {
+        this.lastBlockAt = Date.now();
+        // Only a delivered block proves the socket actually works. Resetting
+        // backoff at subscribe time instead would let a flapping endpoint be
+        // retried at full speed forever.
+        this.attempt = 0;
+      }).catch(() => {}); // rejected when the provider is destroyed mid-subscribe
+
+      // Ethers assigns its own onopen/onmessage/onerror/onclose during start.
+      // Overwriting them silently breaks its message pump — the socket stays
+      // open but no events are ever delivered. Chain onto them instead.
+      const socket = this.provider.websocket;
+      if (socket) {
+        const prevClose = socket.onclose;
+        const prevError = socket.onerror;
+        socket.onclose = (e) => {
+          try { prevClose?.call(socket, e); } finally { this._reconnect('socket closed'); }
+        };
+        socket.onerror = (e) => {
+          try { prevError?.call(socket, e); } finally {
+            this._reconnect(`socket error: ${e?.message || 'unknown'}`);
+          }
+        };
+      }
+
+      this._startHeartbeat();
+      logger.info(`[${this.label}] websocket subscribed to ${this.event}`);
+    } catch (err) {
+      // May already be reconnecting if the socket errored during handshake;
+      // _reconnect guards against double-scheduling.
+      this._reconnect(`connect failed: ${err.shortMessage || err.message}`);
+    }
+  }
+
+  _startHeartbeat() {
+    clearInterval(this.heartbeat);
+    this.heartbeat = setInterval(() => {
+      if (this.stopped) return;
+      if (Date.now() - this.lastBlockAt > 90_000) {
+        this._reconnect('no blocks for 90s — socket presumed dead');
+      }
+    }, 30_000);
+    this.heartbeat.unref?.();
+  }
+
+  _reconnect(reason) {
+    if (this.stopped || this._reconnecting) return;
+    this._reconnecting = true;
+    clearInterval(this.heartbeat);
+
+    const backoff = Math.min(1000 * 2 ** this.attempt, 60_000);
+    this.attempt++;
+    logger.warn(`[${this.label}] ${reason} — reconnecting in ${backoff}ms (attempt ${this.attempt})`);
+
+    this._teardown();
+    setTimeout(() => {
+      this._reconnecting = false;
+      this._connect();
+    }, backoff).unref?.();
+  }
+
+  _teardown() {
+    const provider = this.provider;
+    const socket = provider?.websocket;
+    this.provider = null;
+    this.contract = null;
+
+    if (!provider) return;
+
+    // Neutralise our handlers so closing doesn't re-enter _reconnect — but
+    // with no-ops, never null. Closing a socket that is still CONNECTING makes
+    // ws emit an 'error' event, and an EventEmitter with no 'error' listener
+    // throws and kills the process.
+    if (socket) {
+      socket.onclose = () => {};
+      socket.onerror = () => {};
+    }
+    try { provider.removeAllListeners(); } catch { /* already gone */ }
+
+    // provider.destroy() rejects every still-pending request, including the
+    // eth_subscribe that never completed when a socket dies mid-handshake.
+    // Those rejections have no reachable handler (they live in ethers'
+    // private payload queue) and take the process down. Closing the socket
+    // directly lets ethers run its own close path without that fallout.
+    try { socket?.close(); } catch { /* already closed */ }
+
+    // Only a socket that actually opened has server-side state worth the
+    // destroy() call; deferring it lets the pending payloads settle first.
+    if (socket?.readyState === 1) {
+      setTimeout(() => {
+        try { provider.destroy(); } catch { /* already gone */ }
+      }, 0).unref?.();
+    }
+  }
+
+  stop() {
+    this.stopped = true;
+    clearInterval(this.heartbeat);
+    this._teardown();
+  }
+}
+
+module.exports = {
+  getEvmProvider, getEvmWsUrl, ThrottledProvider, ReconnectingLogWatcher, isRateLimit,
+};

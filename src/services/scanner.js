@@ -147,6 +147,7 @@ class Scanner {
     for (const unsub of this.subscriptions) {
       try { unsub(); } catch { /* already gone */ }
     }
+    try { this.swap.adapter('robinhood').stopWatching(); } catch { /* never started */ }
   }
 }
 
