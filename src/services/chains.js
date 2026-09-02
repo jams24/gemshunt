@@ -17,10 +17,13 @@ const CHAINS = {
     explorer: 'https://robinhoodchain.blockscout.com',
     txUrl: (hash) => `https://robinhoodchain.blockscout.com/tx/${hash}`,
     tokenUrl: (addr) => `https://robinhoodchain.blockscout.com/token/${addr}`,
-    uniswapRouter: '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24', // Uniswap Universal Router
-    uniswapQuoter: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a', // Uniswap Quoter V2
-    weth: '0x4200000000000000000000000000000000000006',
-    uniswapFactory: '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6',
+    universalRouter: '0x8876789976dEcBfCbBbe364623C63652db8C0904',
+    v4Quoter: '0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94',
+    poolManager: '0x8366a39CC670B4001A1121B8F6A443A643e40951',
+    positionManager: '0x58daec3116aae6D93017bAAea7749052E8a04fA7',
+    permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+    weth: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+    bagsFactory: '0xe8Cc4431adF8b5A847C113EF0c6af9043219Cb37',
   },
 };
 

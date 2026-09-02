@@ -40,16 +40,20 @@ async function main() {
     );
   };
 
-  // Listen for Robinhood Chain new pairs
-  robinhoodSwap.listenForNewPairs(async (tokenData) => {
-    if (!adminId) return;
-    await bot.sendAlert(adminId,
-      `🔔 <b>New Token [Robinhood]</b>\n` +
-      `<b>${tokenData.symbol}</b>\n` +
-      `<code>${tokenData.mint}</code>\n\n` +
-      `Switch to Robinhood chain, then:\n/buy ${tokenData.mint}`
-    );
-  });
+  // Listen for Robinhood Chain new pairs (non-fatal)
+  try {
+    robinhoodSwap.listenForNewPairs(async (tokenData) => {
+      if (!adminId) return;
+      await bot.sendAlert(adminId,
+        `🔔 <b>New Token [Robinhood]</b>\n` +
+        `<b>${tokenData.symbol}</b>\n` +
+        `<code>${tokenData.mint}</code>\n\n` +
+        `Switch to Robinhood chain, then:\n/buy ${tokenData.mint}`
+      );
+    });
+  } catch (err) {
+    logger.error(`Robinhood pair listener failed (non-fatal): ${err.message}`);
+  }
 
   // Position monitor
   setInterval(async () => {
@@ -72,6 +76,9 @@ async function main() {
   logger.info('SolSniper running — Solana + Robinhood Chain');
 
   process.on('SIGINT', () => { bot.stop(); process.exit(0); });
+  process.on('unhandledRejection', (err) => {
+    logger.error(`Unhandled rejection: ${err.message || err}`);
+  });
 }
 
 main().catch(err => { logger.error(`Fatal: ${err.message}`); process.exit(1); });
