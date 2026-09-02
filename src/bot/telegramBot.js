@@ -471,49 +471,6 @@ class TelegramBot {
     });
 
     // === PASTE TOKEN ADDRESS TO BUY ===
-    this.bot.on('text', async (ctx) => {
-      const text = ctx.message.text.trim();
-
-      // Handle wallet import
-      if (this.pendingImport.has(ctx.from.id)) {
-        return this._handleImport(ctx, text);
-      }
-
-      // Detect Solana address (base58, 32-44 chars)
-      if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
-        const user = await db.getUser(ctx.from.id);
-        if ((user.active_chain || 'solana') === 'solana' && user.sol_wallet_address) {
-          return ctx.replyWithHTML(
-            `<b>◎ Buy on Solana?</b>\n\n<code>${text}</code>`,
-            this._buyAmountButtons(text)
-          );
-        }
-      }
-
-      // Detect EVM address (0x...)
-      if (/^0x[a-fA-F0-9]{40}$/.test(text)) {
-        const user = await db.getUser(ctx.from.id);
-        if ((user.active_chain) === 'robinhood' && user.evm_wallet_address) {
-          return ctx.replyWithHTML(
-            `<b>🪶 Buy on Robinhood Chain?</b>\n\n<code>${text}</code>`,
-            this._buyAmountButtons(text)
-          );
-        }
-      }
-
-      // Keyboard buttons
-      const BUTTONS = {
-        '👛 Wallet': 'wallet',
-        '📊 Positions': 'positions',
-        '💰 PnL': 'pnl',
-        '🎴 Card': 'card',
-        '📋 Menu': 'menu',
-        '⚙️ Settings': 'settings',
-      };
-      const command = BUTTONS[text] || (text.startsWith('🔗') ? 'chain' : null);
-      if (command) return this._runCommand(ctx, command);
-    });
-
     // === ALERTS ===
     this.bot.command('alerts', async (ctx) => {
       const user = await db.getUser(ctx.from.id);
@@ -598,6 +555,57 @@ class TelegramBot {
       lines.push('', '<i>If the high bands don\'t beat the low ones, the scoring weights need tuning.</i>');
       ctx.replyWithHTML(lines.join('\n'));
     });
+
+    // Catch-all for free text. Must stay registered AFTER every command:
+    // Telegraf middleware runs in order and a command is just a text message,
+    // so anything registered below this that does not get next() called is
+    // unreachable. It falls through at the end for exactly that reason.
+    this.bot.on('text', async (ctx, next) => {
+      const text = ctx.message.text.trim();
+
+      // Handle wallet import
+      if (this.pendingImport.has(ctx.from.id)) {
+        return this._handleImport(ctx, text);
+      }
+
+      // Detect Solana address (base58, 32-44 chars)
+      if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+        const user = await db.getUser(ctx.from.id);
+        if ((user.active_chain || 'solana') === 'solana' && user.sol_wallet_address) {
+          return ctx.replyWithHTML(
+            `<b>◎ Buy on Solana?</b>\n\n<code>${text}</code>`,
+            this._buyAmountButtons(text)
+          );
+        }
+      }
+
+      // Detect EVM address (0x...)
+      if (/^0x[a-fA-F0-9]{40}$/.test(text)) {
+        const user = await db.getUser(ctx.from.id);
+        if ((user.active_chain) === 'robinhood' && user.evm_wallet_address) {
+          return ctx.replyWithHTML(
+            `<b>🪶 Buy on Robinhood Chain?</b>\n\n<code>${text}</code>`,
+            this._buyAmountButtons(text)
+          );
+        }
+      }
+
+      // Keyboard buttons
+      const BUTTONS = {
+        '👛 Wallet': 'wallet',
+        '📊 Positions': 'positions',
+        '💰 PnL': 'pnl',
+        '🎴 Card': 'card',
+        '📋 Menu': 'menu',
+        '⚙️ Settings': 'settings',
+      };
+      const command = BUTTONS[text] || (text.startsWith('🔗') ? 'chain' : null);
+      if (command) return this._runCommand(ctx, command);
+
+      // Nothing matched — hand off rather than swallowing the update.
+      return next();
+    });
+
   }
 
   setupCallbacks() {
