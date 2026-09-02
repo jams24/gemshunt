@@ -47,6 +47,21 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
     this._consecutive429 = 0;
     this._breakerUntil = 0;
     this._pollingPaused = false;
+
+    // Rate limiting is a sustained condition, not an event. Report it as a
+    // rolling summary so the logs stay readable.
+    this._throttledCount = 0;
+    this._summary = setInterval(() => {
+      if (this._throttledCount === 0) return;
+      logger.warn(
+        `[evm] ${this._throttledCount} requests throttled in the last minute. ` +
+        (process.env.ROBINHOOD_RPC_URL
+          ? 'Your private RPC is rate limiting — check its plan limits.'
+          : 'You are on the PUBLIC RPC. Set ROBINHOOD_RPC_URL to a private endpoint.')
+      );
+      this._throttledCount = 0;
+    }, 60_000);
+    this._summary.unref?.();
   }
 
   get rateLimited() {
@@ -83,11 +98,11 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
         if (!isRateLimit(err)) throw err;
 
         this._on429();
+        this._throttledCount++;
         if (this.rateLimited || attempt === this.maxRetries) break;
 
         // 250ms, 750ms, 2.25s — plus jitter so retries don't resynchronise.
         const backoff = 250 * 3 ** attempt + Math.random() * 200;
-        logger.warn(`[evm] 429 on ${method}, backing off ${Math.round(backoff)}ms`);
         await sleep(backoff);
       }
     }
@@ -96,7 +111,10 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
 
   _onSuccess() {
     if (this._consecutive429 > 0) {
-      logger.info('[evm] RPC recovered');
+      // Only worth a line if it was genuinely degraded. Logging every recovery
+      // turns normal throttle oscillation into a wall of noise that hides real
+      // problems; the periodic summary below carries the actual signal.
+      if (this._consecutive429 >= this.breakerThreshold) logger.info('[evm] RPC recovered');
       this._consecutive429 = 0;
     }
     if (this._pollingPaused) this._resumePolling();
@@ -143,6 +161,9 @@ function isRateLimit(err) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+/** Hide the API key when logging an endpoint. */
+const redact = (url) => String(url).replace(/\/v2\/[^/?]+/, '/v2/***').replace(/([?&](api[-_]?key|key)=)[^&]+/gi, '$1***');
+
 // One provider per chain, shared by the wallet and swap adapters. Two separate
 // providers meant two independent polling loops against the same endpoint.
 const providers = new Map();
@@ -168,7 +189,20 @@ function getEvmProvider(chainConfig) {
   });
 
   providers.set(key, provider);
-  logger.info(`[evm] provider ready (${url}, poll ${provider.pollingInterval}ms)`);
+
+  // Make the active configuration obvious. Diagnosing "why is it still being
+  // rate limited" from request logs alone is guesswork.
+  const isPublic = !process.env.ROBINHOOD_RPC_URL;
+  const wsUrl = getEvmWsUrl(chainConfig);
+  logger.info(`[evm] HTTP endpoint : ${redact(url)}${isPublic ? '  <-- PUBLIC, rate limited' : '  (private)'}`);
+  logger.info(`[evm] pool detection: ${wsUrl ? `WEBSOCKET ${redact(wsUrl)}` : `HTTP POLLING every ${provider.pollingInterval}ms`}`);
+  if (isPublic) {
+    logger.warn(
+      '[evm] Running on the public Robinhood RPC. Expect 429s and delayed pool ' +
+      'detection. Set ROBINHOOD_RPC_URL (and optionally ROBINHOOD_WS_URL) in ' +
+      'your deployment environment — a .env file on your laptop is not enough.'
+    );
+  }
   return provider;
 }
 
