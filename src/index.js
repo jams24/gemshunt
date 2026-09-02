@@ -1,84 +1,115 @@
-require('dotenv').config();
+const config = require('./config');
 const { Connection } = require('@solana/web3.js');
 const logger = require('./utils/logger');
 const db = require('./db/database');
-const JupiterService = require('./services/jupiter');
-const WalletManager = require('./services/walletManager');
-const RobinhoodSwapService = require('./services/robinhoodSwap');
-const TokenScanner = require('./services/tokenScanner');
+const CHAINS = require('./services/chains');
+
+const WalletManager = require('./services/wallet');
+const SwapRouter = require('./services/swap');
+const Analyzer = require('./analysis');
+const Scanner = require('./services/scanner');
+const Alerter = require('./services/alerter');
+const Tracker = require('./services/tracker');
 const TradeEngine = require('./engine/tradeEngine');
 const TelegramBot = require('./bot/telegramBot');
 
 async function main() {
-  logger.info('Starting SolSniper Bot...');
-
+  logger.info('Starting SolSniper...');
   await db.init();
 
-  const solConnection = new Connection(process.env.SOLANA_RPC_URL, {
+  const connection = new Connection(config.solana.rpcUrl, {
     commitment: 'confirmed',
-    wsEndpoint: process.env.SOLANA_WS_URL,
+    wsEndpoint: config.solana.wsUrl,
   });
 
-  const walletManager = new WalletManager(solConnection);
-  const jupiter = new JupiterService(solConnection);
-  const robinhoodSwap = new RobinhoodSwapService();
-  const engine = new TradeEngine(jupiter, walletManager, robinhoodSwap);
-  const scanner = new TokenScanner(solConnection, db);
-  const bot = new TelegramBot(engine, walletManager);
+  // --- core services ---
+  const walletManager = new WalletManager(connection, config.encryptionKey);
+  const swapRouter = new SwapRouter(connection);
+  const analyzer = new Analyzer({ db, solanaConnection: connection, swapRouter });
+  const engine = new TradeEngine({ swapRouter, walletManager, config });
+  const scanner = new Scanner({ connection, swapRouter, db });
+  const tracker = new Tracker({
+    db, swapRouter, marketData: analyzer.market, connection, config,
+  });
 
-  // New token alerts to admin
-  const adminId = parseInt(process.env.TELEGRAM_ADMIN_ID);
+  const bot = new TelegramBot({
+    tradeEngine: engine, walletManager, swapRouter, analyzer, tracker, config,
+  });
+  const alerter = new Alerter({ db, bot, config });
 
-  scanner.onNewToken = async (tokenData) => {
-    if (!adminId) return;
-    await bot.sendAlert(adminId,
-      `🔔 <b>New Token [Solana]</b>\n` +
-      `<b>${tokenData.symbol}</b> | ${tokenData.isSafe ? '✅ Safe' : '⚠️ Risky'}\n` +
-      `Liquidity: ${tokenData.liquiditySol.toFixed(2)} SOL\n` +
-      `<code>${tokenData.mint}</code>\n\n` +
-      `/buy ${tokenData.mint}`
-    );
+  // --- new token → analyze → persist → alert → track ---
+  scanner.onNewToken = async (raw) => {
+    try {
+      const { token, analysis } = await analyzer.analyze(raw);
+
+      // Track anything worth alerting on, so we learn whether the thesis was
+      // right even when nobody buys it.
+      if (analysis.score >= config.alerts.minScore) {
+        token.trackingUntil = tracker.trackingDeadline();
+      }
+      await db.saveToken(token);
+      await alerter.dispatchNewToken(token, analysis);
+    } catch (err) {
+      logger.error(`[pipeline] ${raw.chain}/${raw.mint}: ${err.message}`);
+    }
   };
 
-  // Listen for Robinhood Chain new pairs (non-fatal)
-  try {
-    robinhoodSwap.listenForNewPairs(async (tokenData) => {
-      if (!adminId) return;
-      await bot.sendAlert(adminId,
-        `🔔 <b>New Token [Robinhood]</b>\n` +
-        `<b>${tokenData.symbol}</b>\n` +
-        `<code>${tokenData.mint}</code>\n\n` +
-        `Switch to Robinhood chain, then:\n/buy ${tokenData.mint}`
-      );
-    });
-  } catch (err) {
-    logger.error(`Robinhood pair listener failed (non-fatal): ${err.message}`);
-  }
+  tracker.onSmartMoneyBuy = async (token, wallets) => {
+    try {
+      const info = await swapRouter.getTokenInfo(token.chain, token.mint).catch(() => null);
+      await alerter.dispatchSmartMoney({ ...token, symbol: info?.symbol || token.mint.slice(0, 6) }, wallets);
+    } catch (err) {
+      logger.error(`[pipeline] smart-money alert: ${err.message}`);
+    }
+  };
 
-  // Position monitor
-  setInterval(async () => {
-    try { await engine.checkAllPositions(); } catch (err) { logger.error(`Position check: ${err.message}`); }
-  }, 30 * 1000);
+  // --- position monitor ---
+  const positionTimer = setInterval(() => {
+    engine.checkAllPositions().catch(err => logger.error(`[monitor] ${err.message}`));
+  }, config.positionCheckIntervalSec * 1000);
 
+  // --- start everything ---
   await bot.launch();
-  await scanner.startListening();
+  await scanner.start();
+  tracker.start();
+  await tracker.startWalletWatching();
 
-  if (adminId) {
-    const { rows: [s] } = await db.query(`SELECT COUNT(*) as c FROM users`);
-    await bot.sendAlert(adminId,
-      `🚀 <b>SolSniper Online</b>\n\n` +
-      `Chains: ◎ Solana + 🪶 Robinhood\n` +
-      `Users: ${s.c} | Fee: ${process.env.PLATFORM_FEE_PCT || 1}%\n` +
-      `Listening for new pools...`
+  if (config.telegram.adminId) {
+    const { rows: [s] } = await db.query('SELECT COUNT(*)::int AS c FROM users');
+    const { rows: [w] } = await db.query('SELECT COUNT(*)::int AS c FROM wallet_watch WHERE is_active');
+    await bot.sendAlert(config.telegram.adminId,
+      `🚀 <b>SolSniper online</b>\n\n` +
+      `Chains: ${Object.values(CHAINS).map(c => `${c.emoji} ${c.name}`).join(' + ')}\n` +
+      `Users: ${s.c}  ·  Tracked wallets: ${w.c}\n` +
+      `Alert threshold: ${config.alerts.minScore}/100  ·  Fee: ${config.trading.platformFeePct}%\n\n` +
+      `Scanning for new pools.`
     );
   }
 
-  logger.info('SolSniper running — Solana + Robinhood Chain');
+  logger.info('SolSniper running');
 
-  process.on('SIGINT', () => { bot.stop(); process.exit(0); });
+  const shutdown = (signal) => {
+    logger.info(`${signal} — shutting down`);
+    clearInterval(positionTimer);
+    scanner.stop();
+    tracker.stop();
+    bot.stop();
+    db.pool.end().finally(() => process.exit(0));
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+  // A rejected promise anywhere must not take the bot down mid-position.
   process.on('unhandledRejection', (err) => {
-    logger.error(`Unhandled rejection: ${err.message || err}`);
+    logger.error(`Unhandled rejection: ${err?.stack || err?.message || err}`);
+  });
+  process.on('uncaughtException', (err) => {
+    logger.error(`Uncaught exception: ${err?.stack || err?.message || err}`);
   });
 }
 
-main().catch(err => { logger.error(`Fatal: ${err.message}`); process.exit(1); });
+main().catch((err) => {
+  logger.error(`Fatal: ${err.message}`);
+  console.error(err);
+  process.exit(1);
+});

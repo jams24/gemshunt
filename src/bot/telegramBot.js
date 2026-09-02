@@ -3,16 +3,21 @@ const logger = require('../utils/logger');
 const db = require('../db/database');
 const CHAINS = require('../services/chains');
 const { generateTradeCard, generateMonthlyCard, formatHoldTime } = require('../services/pnlCard');
+const { renderAlert, money, scoreBar, scoreEmoji } = require('../analysis/thesis');
 
-const FEE_PCT = parseFloat(process.env.PLATFORM_FEE_PCT) || 1.0;
 const REFERRAL_FEE_SHARE = parseFloat(process.env.REFERRAL_FEE_SHARE) || 0.25;
 
 class TelegramBot {
-  constructor(tradeEngine, walletManager) {
-    this.bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+  constructor({ tradeEngine, walletManager, swapRouter, analyzer, tracker, config }) {
+    this.bot = new Telegraf(config.telegram.token);
     this.engine = tradeEngine;
     this.walletManager = walletManager;
-    this.adminId = parseInt(process.env.TELEGRAM_ADMIN_ID);
+    this.swap = swapRouter;
+    this.analyzer = analyzer;
+    this.tracker = tracker;
+    this.config = config;
+    this.feePct = config.trading.platformFeePct;
+    this.adminId = config.telegram.adminId;
     this.pendingImport = new Map();
     this.setupMiddleware();
     this.setupCommands();
@@ -59,19 +64,84 @@ class TelegramBot {
   }
 
   _walletButtons(user) {
-    const chain = user.active_chain || 'solana';
-    const hasWallet = chain === 'solana' ? user.sol_wallet_address : user.evm_wallet_address;
-    if (hasWallet) {
-      return Markup.inlineKeyboard([
-        [Markup.button.callback('🔄 Refresh', 'refresh_balance'), Markup.button.callback('📤 Withdraw', 'withdraw_prompt')],
+    const hasAny = user.sol_wallet_address || user.evm_wallet_address;
+    const missing = [];
+    if (!user.sol_wallet_address) missing.push('solana');
+    if (!user.evm_wallet_address) missing.push('robinhood');
+
+    if (hasAny) {
+      const rows = [
+        [Markup.button.callback('🔄 Refresh', 'wallet_refresh'), Markup.button.callback('📤 Withdraw', 'withdraw_prompt')],
         [Markup.button.callback('🔑 Export Key', 'export_key'), Markup.button.callback('🔗 Switch Chain', 'switch_chain')],
-      ]);
+      ];
+      if (missing.length) {
+        rows.unshift([Markup.button.callback(
+          `🆕 Create missing wallet${missing.length > 1 ? 's' : ''}`, 'wallet_create'
+        )]);
+      }
+      return Markup.inlineKeyboard(rows);
     }
     return Markup.inlineKeyboard([
-      [Markup.button.callback('🆕 Create Wallet', 'wallet_create')],
+      [Markup.button.callback('🆕 Create Wallets (all chains)', 'wallet_create')],
       [Markup.button.callback('📥 Import Wallet', 'wallet_import')],
-      [Markup.button.callback('🔗 Switch Chain', 'switch_chain')],
     ]);
+  }
+
+  /**
+   * Portfolio across every chain in one message: native balance, USD value,
+   * held tokens, and open positions — so a user never has to switch chain
+   * just to find out what they own.
+   */
+  async _renderPortfolio(user) {
+    const portfolio = await this.walletManager.getPortfolio(
+      user, (chain) => this.swap.getNativePriceUsd(chain)
+    );
+    const positions = await db.getUserPositions(user.telegram_id, 'open');
+    const active = user.active_chain || 'solana';
+
+    const lines = ['<b>👛 Portfolio</b>'];
+    if (portfolio.totalUsd > 0) lines.push(`Total: <b>${money(portfolio.totalUsd)}</b>`);
+    lines.push('');
+
+    for (const c of portfolio.chains) {
+      const meta = c.meta;
+      lines.push(`${meta.emoji} <b>${meta.name}</b>${c.chain === active ? ' · <i>active</i>' : ''}`);
+
+      if (!c.address) {
+        lines.push('  <i>no wallet — tap Create below</i>', '');
+        continue;
+      }
+      lines.push(`  <code>${c.address}</code>`);
+
+      if (c.error) {
+        lines.push(`  ⚠️ <i>unavailable: ${c.error.slice(0, 60)}</i>`, '');
+        continue;
+      }
+
+      const usd = c.nativeUsd != null ? ` (${money(c.nativeUsd)})` : '';
+      lines.push(`  <b>${c.native.toFixed(4)} ${meta.currency}</b>${usd}`);
+
+      const chainPositions = positions.filter(p => (p.chain || 'solana') === c.chain);
+      for (const p of chainPositions) {
+        const pnl = p.pnl_pct || 0;
+        lines.push(`  ${pnl >= 0 ? '🟢' : '🔴'} ${p.symbol || p.mint.slice(0, 6)} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`);
+      }
+
+      // Tokens held but not tracked as a position (airdrops, manual buys).
+      const tracked = new Set(chainPositions.map(p => p.mint.toLowerCase()));
+      const untracked = (c.tokens || []).filter(t => !tracked.has(t.mint.toLowerCase()));
+      if (untracked.length) {
+        const preview = untracked.slice(0, 3)
+          .map(t => `${t.symbol || t.mint.slice(0, 5)} ${t.uiAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })}`)
+          .join(', ');
+        const more = untracked.length > 3 ? ` +${untracked.length - 3} more` : '';
+        lines.push(`  <i>Untracked: ${preview}${more}</i>`);
+      }
+      lines.push('');
+    }
+
+    lines.push('<i>Deposit to any address above to trade on that chain.</i>');
+    return lines.join('\n');
   }
 
   _sellButtons(mint) {
@@ -114,9 +184,7 @@ class TelegramBot {
 
       if (hasWallet) {
         const walletAddr = info.chain === 'solana' ? user.sol_wallet_address : user.evm_wallet_address;
-        const bal = info.chain === 'solana'
-          ? await this.walletManager.getSolanaBalance(walletAddr)
-          : await this.engine.robinhoodSwap.getBalance(walletAddr);
+        const bal = await this.walletManager.getBalance(info.chain, walletAddr);
 
         return ctx.replyWithHTML(
           `<b>⚡ SolSniper</b>\n\n` +
@@ -132,7 +200,7 @@ class TelegramBot {
         `<b>⚡ SolSniper</b>\n\n` +
         `The fastest multi-chain token sniper.\n` +
         `◎ <b>Solana</b> + 🪶 <b>Robinhood Chain</b>\n\n` +
-        `${FEE_PCT}% fee per trade. That's it.\n\n` +
+        `${this.feePct}% fee per trade. That's it.\n\n` +
         `Select your chain:`,
         Markup.inlineKeyboard([
           [Markup.button.callback('◎ Solana', 'onboard_solana')],
@@ -159,6 +227,12 @@ class TelegramBot {
         `/wallet — Balance & deposit\n` +
         `/withdraw <code>addr</code> <code>amount</code>\n` +
         `/export — Private key\n\n` +
+        `<b>Alerts & Research:</b>\n` +
+        `/alerts — Alert settings\n` +
+        `/scan <code>address</code> — Analyze a token\n` +
+        `/watch <code>wallet</code> — Track smart money\n` +
+        `/watchlist — Tracked wallets\n` +
+        `/analytics — Thesis engine hit rate\n\n` +
         `<b>Settings:</b>\n` +
         `/chain — Switch chain\n` +
         `/setbuy — Buy amount | /setslippage\n` +
@@ -179,28 +253,20 @@ class TelegramBot {
     });
 
     // === WALLET ===
+    // One screen for every chain — no drilling down, no /chain switch first.
     this.bot.command('wallet', async (ctx) => {
       const user = await db.getUser(ctx.from.id);
-      const info = this._chainInfo(user);
-      const walletAddr = info.chain === 'solana' ? user.sol_wallet_address : user.evm_wallet_address;
-
-      if (!walletAddr) {
+      if (!user.sol_wallet_address && !user.evm_wallet_address) {
         return ctx.replyWithHTML(
-          `<b>👛 No ${info.name} wallet yet</b>\n\nCreate or import:`,
+          `<b>👛 No wallets yet</b>\n\nCreate one for every chain in a single tap:`,
           this._walletButtons(user)
         );
       }
-
-      const bal = info.chain === 'solana'
-        ? await this.walletManager.getSolanaBalance(walletAddr)
-        : await this.engine.robinhoodSwap.getBalance(walletAddr);
-
-      ctx.replyWithHTML(
-        `<b>👛 ${info.emoji} ${info.name} Wallet</b>\n\n` +
-        `Address:\n<code>${walletAddr}</code>\n\n` +
-        `Balance: <b>${bal.toFixed(4)} ${info.currency}</b>\n\n` +
-        `Send ${info.currency} to this address to start trading.`,
-        this._walletButtons(user)
+      const loading = await ctx.reply('👛 Loading portfolio...');
+      const text = await this._renderPortfolio(user);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, loading.message_id, undefined, text,
+        { parse_mode: 'HTML', disable_web_page_preview: true, ...this._walletButtons(user) }
       );
     });
 
@@ -214,15 +280,12 @@ class TelegramBot {
       const amount = parseFloat(args[1]);
       if (!amount || amount <= 0) return ctx.reply('Invalid amount.');
 
+      const enc = info.chain === 'solana' ? user.sol_wallet_key_encrypted : user.evm_wallet_key_encrypted;
       try {
-        let sig;
-        if (info.chain === 'solana') {
-          sig = await this.walletManager.withdrawSolana(user.sol_wallet_key_encrypted, toAddr, amount);
-        } else {
-          const pk = this.walletManager.getEvmPrivateKey(user.evm_wallet_key_encrypted);
-          sig = await this.engine.robinhoodSwap.withdraw(pk, toAddr, amount);
-        }
-        ctx.replyWithHTML(`✅ <b>Sent ${amount} ${info.currency}</b>\n\nTX: <code>${sig}</code>`);
+        const sig = await this.walletManager.withdrawNative(info.chain, enc, toAddr, amount);
+        ctx.replyWithHTML(
+          `✅ <b>Sent ${amount} ${info.currency}</b>\n\n<a href="${CHAINS[info.chain].txUrl(sig)}">View TX</a>`
+        );
       } catch (err) {
         ctx.reply(`❌ ${err.message}`);
       }
@@ -384,7 +447,7 @@ class TelegramBot {
     this.bot.command('fees', (ctx) => {
       ctx.replyWithHTML(
         `<b>💸 Fees</b>\n\n` +
-        `${FEE_PCT}% per trade (buy + sell)\n` +
+        `${this.feePct}% per trade (buy + sell)\n` +
         `Referrals earn ${(REFERRAL_FEE_SHARE * 100)}% of fees.\n` +
         `/referral for your link.`
       );
@@ -447,6 +510,91 @@ class TelegramBot {
       if (text.startsWith('🔗')) return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/chain' } });
       if (text === '⚙️ Settings') return this.bot.handleUpdate({ ...ctx.update, message: { ...ctx.message, text: '/settings' } });
     });
+
+    // === ALERTS ===
+    this.bot.command('alerts', async (ctx) => {
+      const user = await db.getUser(ctx.from.id);
+      ctx.replyWithHTML(this._renderAlertSettings(user), this._alertButtons(user));
+    });
+
+    this.bot.command('setscore', async (ctx) => {
+      const v = parseInt(ctx.message.text.split(' ')[1], 10);
+      if (!Number.isInteger(v) || v < 0 || v > 100) {
+        return ctx.reply('Usage: /setscore <0-100>  — minimum conviction score to alert you');
+      }
+      await db.updateUser(ctx.from.id, { alert_min_score: v });
+      ctx.reply(`✅ You'll only be alerted on tokens scoring ${v}+`);
+    });
+
+    // === ON-DEMAND ANALYSIS ===
+    this.bot.command('scan', async (ctx) => {
+      const args = ctx.message.text.split(' ').slice(1);
+      if (!args[0]) return ctx.reply('Usage: /scan <token_address>');
+      await this._sendAnalysis(ctx, args[0]);
+    });
+
+    // === SMART MONEY WATCHLIST ===
+    this.bot.command('watch', async (ctx) => {
+      const args = ctx.message.text.split(' ').slice(1);
+      if (!args[0]) return ctx.reply('Usage: /watch <wallet_address> [label]');
+      const address = args[0];
+      const label = args.slice(1).join(' ') || null;
+
+      const chain = this.walletManager.isValidAddress('solana', address) ? 'solana'
+        : this.walletManager.isValidAddress('robinhood', address) ? 'robinhood'
+        : null;
+      if (!chain) return ctx.reply('❌ Not a valid Solana or EVM address.');
+      if (chain === 'robinhood') {
+        return ctx.reply('⚠️ Wallet tracking is Solana-only for now — Robinhood Chain has no indexer to read historic wallet activity from.');
+      }
+
+      const wallet = await db.addWatchedWallet(chain, address, label, ctx.from.id);
+      await this.tracker?.watchWallet(wallet);
+      ctx.replyWithHTML(
+        `🧠 <b>Now tracking</b>\n<code>${address}</code>\n` +
+        `${label ? `Label: ${label}\n` : ''}\n` +
+        `You'll get a priority alert when 2+ tracked wallets buy the same token.`
+      );
+    });
+
+    this.bot.command('unwatch', async (ctx) => {
+      const address = ctx.message.text.split(' ')[1];
+      if (!address) return ctx.reply('Usage: /unwatch <wallet_address>');
+      await db.removeWatchedWallet('solana', address);
+      this.tracker?.unwatchWallet(address);
+      ctx.reply('✅ Stopped tracking that wallet.');
+    });
+
+    this.bot.command('watchlist', async (ctx) => {
+      const wallets = await db.getWatchedWallets();
+      if (!wallets.length) {
+        return ctx.replyWithHTML('No wallets tracked yet.\n\nAdd one: <code>/watch &lt;address&gt; [label]</code>');
+      }
+      const lines = wallets.map(w =>
+        `${CHAINS[w.chain]?.emoji || ''} <b>${w.label || w.address.slice(0, 8) + '…'}</b>\n  <code>${w.address}</code>`
+      );
+      ctx.replyWithHTML(`<b>🧠 Tracked wallets (${wallets.length})</b>\n\n${lines.join('\n')}`);
+    });
+
+    // === ANALYTICS ===
+    this.bot.command('analytics', async (ctx) => {
+      const bands = await db.getScoreBandPerformance();
+      if (!bands.length) {
+        return ctx.reply('Not enough tracked tokens yet — analytics appear once alerted tokens have run their 24h tracking window.');
+      }
+      const lines = ['<b>📈 Thesis engine performance</b>', '<i>Peak multiple reached after alert</i>', ''];
+      for (const b of bands) {
+        const rate2x = b.total ? ((b.hit_2x / b.total) * 100).toFixed(0) : '0';
+        const rugRate = b.total ? ((b.rugs / b.total) * 100).toFixed(0) : '0';
+        lines.push(
+          `<b>Score ${b.band}</b> — ${b.total} tokens\n` +
+          `  2x+: ${rate2x}%  ·  5x+: ${b.total ? ((b.hit_5x / b.total) * 100).toFixed(0) : 0}%  ·  rugs: ${rugRate}%\n` +
+          `  avg peak: ${b.avg_peak || '—'}x`
+        );
+      }
+      lines.push('', '<i>If the high bands don\'t beat the low ones, the scoring weights need tuning.</i>');
+      ctx.replyWithHTML(lines.join('\n'));
+    });
   }
 
   setupCallbacks() {
@@ -487,35 +635,45 @@ class TelegramBot {
     });
 
     // === WALLET CREATE ===
+    // Create every missing chain at once. A user who only has a Solana wallet
+    // and then taps a Robinhood alert should not hit "no wallet" mid-trade.
     this.bot.action('wallet_create', async (ctx) => {
       await ctx.answerCbQuery();
       const user = await db.getUser(ctx.from.id);
-      const chain = user.active_chain || 'solana';
-      const info = CHAINS[chain];
 
-      let wallet, updates;
-      if (chain === 'solana') {
-        wallet = this.walletManager.createSolanaWallet();
-        updates = {
-          sol_wallet_address: wallet.publicKey,
-          sol_wallet_key_encrypted: this.walletManager.encrypt(wallet.privateKey),
-        };
-      } else {
-        wallet = this.walletManager.createEvmWallet();
-        updates = {
-          evm_wallet_address: wallet.publicKey,
-          evm_wallet_key_encrypted: this.walletManager.encrypt(wallet.privateKey),
-        };
+      const created = [];
+      const updates = {};
+      if (!user.sol_wallet_address) {
+        const w = this.walletManager.createWallet('solana');
+        updates.sol_wallet_address = w.publicKey;
+        updates.sol_wallet_key_encrypted = w.encrypted;
+        created.push({ chain: 'solana', ...w });
       }
+      if (!user.evm_wallet_address) {
+        const w = this.walletManager.createWallet('robinhood');
+        updates.evm_wallet_address = w.publicKey;
+        updates.evm_wallet_key_encrypted = w.encrypted;
+        created.push({ chain: 'robinhood', ...w });
+      }
+
+      if (!created.length) return ctx.reply('You already have a wallet on every chain.');
       await db.updateUser(ctx.from.id, updates);
+      this.walletManager.forget(ctx.from.id);
+
+      const blocks = created.map(w => {
+        const meta = CHAINS[w.chain];
+        return `${meta.emoji} <b>${meta.name}</b>\n` +
+               `<code>${w.publicKey}</code>\n` +
+               `Key: <tg-spoiler>${w.privateKey}</tg-spoiler>`;
+      });
 
       ctx.replyWithHTML(
-        `✅ <b>${info.emoji} ${info.name} Wallet Created!</b>\n\n` +
-        `Address:\n<code>${wallet.publicKey}</code>\n\n` +
-        `<b>⚠️ SAVE YOUR KEY:</b>\n<tg-spoiler>${wallet.privateKey}</tg-spoiler>\n\n` +
-        `Tap to reveal. Store it safely.\n\n` +
-        `<b>Next:</b> Send ${info.currency} to this address, then paste a token address to buy.`,
-        this._mainKeyboard(chain)
+        `✅ <b>Wallet${created.length > 1 ? 's' : ''} created</b>\n\n` +
+        blocks.join('\n\n') +
+        `\n\n<b>⚠️ Save those keys now.</b> Tap to reveal — they are shown once ` +
+        `and we cannot recover them for you.\n\n` +
+        `Deposit, then paste any token address to buy.`,
+        this._mainKeyboard(user.active_chain || 'solana')
       );
     });
 
@@ -571,15 +729,22 @@ class TelegramBot {
     });
 
     // === WALLET ACTIONS ===
-    this.bot.action('refresh_balance', async (ctx) => {
+    this.bot.action('wallet_refresh', async (ctx) => {
+      await ctx.answerCbQuery('Refreshing...');
       const user = await db.getUser(ctx.from.id);
-      const info = this._chainInfo(user);
-      const addr = info.chain === 'solana' ? user.sol_wallet_address : user.evm_wallet_address;
-      if (!addr) return ctx.answerCbQuery('No wallet');
-      const bal = info.chain === 'solana'
-        ? await this.walletManager.getSolanaBalance(addr)
-        : await this.engine.robinhoodSwap.getBalance(addr);
-      await ctx.answerCbQuery(`${bal.toFixed(4)} ${info.currency}`);
+      try {
+        const text = await this._renderPortfolio(user);
+        await ctx.editMessageText(text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...this._walletButtons(user),
+        });
+      } catch (err) {
+        // Telegram rejects an edit when the text is byte-identical.
+        if (!/message is not modified/i.test(err.message)) {
+          ctx.reply(`❌ ${err.message}`);
+        }
+      }
     });
 
     this.bot.action('confirm_export', async (ctx) => {
@@ -595,6 +760,59 @@ class TelegramBot {
 
     this.bot.action('cancel_action', (ctx) => { ctx.answerCbQuery('Cancelled'); ctx.deleteMessage().catch(() => {}); });
     this.bot.action('withdraw_prompt', (ctx) => { ctx.answerCbQuery(); ctx.reply('/withdraw <address> <amount>'); });
+    // === ALERT CALLBACKS ===
+    this.bot.action('alerts_toggle', async (ctx) => {
+      const user = await db.getUser(ctx.from.id);
+      const next = !user.alerts_enabled;
+      await db.updateUser(ctx.from.id, { alerts_enabled: next });
+      await ctx.answerCbQuery(next ? 'Alerts ON' : 'Alerts OFF');
+      const fresh = await db.getUser(ctx.from.id);
+      await ctx.editMessageText(this._renderAlertSettings(fresh), {
+        parse_mode: 'HTML', ...this._alertButtons(fresh),
+      }).catch(() => {});
+    });
+
+    this.bot.action('alerts_off', async (ctx) => {
+      await db.updateUser(ctx.from.id, { alerts_enabled: false });
+      await ctx.answerCbQuery('Alerts muted. Re-enable with /alerts');
+    });
+
+    this.bot.action(/alertscore_(\d+)/, async (ctx) => {
+      const v = parseInt(ctx.match[1], 10);
+      await db.updateUser(ctx.from.id, { alert_min_score: v });
+      await ctx.answerCbQuery(`Min score: ${v}`);
+      const fresh = await db.getUser(ctx.from.id);
+      await ctx.editMessageText(this._renderAlertSettings(fresh), {
+        parse_mode: 'HTML', ...this._alertButtons(fresh),
+      }).catch(() => {});
+    });
+
+    this.bot.action(/alertchain_(\w+)/, async (ctx) => {
+      const chain = ctx.match[1];
+      const user = await db.getUser(ctx.from.id);
+      const current = new Set((user.alert_chains || 'solana,robinhood').split(',').filter(Boolean));
+      if (current.has(chain)) current.delete(chain); else current.add(chain);
+      await db.updateUser(ctx.from.id, { alert_chains: [...current].join(',') });
+      await ctx.answerCbQuery(`${CHAINS[chain].name}: ${current.has(chain) ? 'on' : 'off'}`);
+      const fresh = await db.getUser(ctx.from.id);
+      await ctx.editMessageText(this._renderAlertSettings(fresh), {
+        parse_mode: 'HTML', ...this._alertButtons(fresh),
+      }).catch(() => {});
+    });
+
+    // Buy straight from an alert. The chain rides in the callback data, so
+    // there is no "switch chain first" step between seeing a call and taking it.
+    this.bot.action(/abuy_(\w+)_([^_]+)_([\d.]+)/, async (ctx) => {
+      const [, chain, mint, amountStr] = ctx.match;
+      await ctx.answerCbQuery(`Buying ${amountStr} on ${CHAINS[chain]?.name || chain}...`);
+      await this._executeBuy(ctx, mint, parseFloat(amountStr), chain);
+    });
+
+    this.bot.action(/analyze_(\w+)_(.+)/, async (ctx) => {
+      await ctx.answerCbQuery();
+      await this._sendAnalysis(ctx, ctx.match[2], ctx.match[1]);
+    });
+
     this.bot.action('export_key', (ctx) => {
       ctx.answerCbQuery();
       ctx.replyWithHTML('⚠️ <b>Show private key?</b>', Markup.inlineKeyboard([
@@ -603,29 +821,103 @@ class TelegramBot {
     });
   }
 
-  // === TRADE EXECUTION ===
-  async _executeBuy(ctx, mint, amount) {
+  // === ALERT SETTINGS ===
+  _renderAlertSettings(user) {
+    const chains = (user.alert_chains || 'solana,robinhood').split(',');
+    const chainLabels = Object.entries(CHAINS)
+      .map(([k, c]) => `${chains.includes(k) ? '✅' : '⬜'} ${c.emoji} ${c.name}`)
+      .join('\n  ');
+
+    return [
+      `<b>🔔 Alert settings</b>`,
+      '',
+      `Status: <b>${user.alerts_enabled ? 'ON' : 'OFF'}</b>`,
+      `Min score: <b>${user.alert_min_score ?? 60}</b>/100`,
+      `Min liquidity: <b>${user.alert_min_liquidity ?? 5}</b> (native)`,
+      `Chains:\n  ${chainLabels}`,
+      '',
+      `<i>Only tokens the thesis engine scores at or above your minimum are sent. Raise it for fewer, higher-conviction calls.</i>`,
+    ].join('\n');
+  }
+
+  _alertButtons(user) {
+    const score = user.alert_min_score ?? 60;
+    return Markup.inlineKeyboard([
+      [Markup.button.callback(user.alerts_enabled ? '🔕 Turn OFF' : '🔔 Turn ON', 'alerts_toggle')],
+      [40, 60, 75, 85].map(v =>
+        Markup.button.callback(`${score === v ? '•' : ''}${v}`, `alertscore_${v}`)
+      ),
+      Object.entries(CHAINS).map(([k, c]) =>
+        Markup.button.callback(`${c.emoji} ${c.name}`, `alertchain_${k}`)
+      ),
+    ]);
+  }
+
+  /** Run the thesis engine on demand and reply with the full breakdown. */
+  async _sendAnalysis(ctx, mint, chainHint) {
     const user = await db.getUser(ctx.from.id);
-    const info = this._chainInfo(user);
-    const buyAmount = amount || user.max_buy_amount || 0.1;
-    const fee = buyAmount * (FEE_PCT / 100);
+    const chain = chainHint
+      || (this.walletManager.isValidAddress('solana', mint) ? 'solana' : 'robinhood');
+
+    const msg = await ctx.reply('🔬 Analyzing...');
+    try {
+      const stored = await db.getToken(chain, mint);
+      const { token, analysis } = await this.analyzer.analyze({
+        chain, mint,
+        deployer: stored?.deployer,
+        liquidityNative: stored?.liquidity_sol,
+        symbol: stored?.symbol,
+      });
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, undefined,
+        renderAlert(token, analysis),
+        {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: {
+            inline_keyboard: [
+              [0.05, 0.1, 0.5, 1].map(a => ({
+                text: `Buy ${a}`,
+                callback_data: `abuy_${chain}_${mint}_${a}`,
+              })),
+            ],
+          },
+        }
+      );
+    } catch (err) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, undefined, `❌ Analysis failed: ${err.message}`
+      );
+    }
+  }
+
+  // === TRADE EXECUTION ===
+  async _executeBuy(ctx, mint, amount, chainOverride) {
+    const user = await db.getUser(ctx.from.id);
+    const chain = chainOverride || user.active_chain || 'solana';
+    const meta = CHAINS[chain];
+    const buyAmount = amount || user.max_buy_amount || this.config.trading.maxBuyNative;
+    const fee = buyAmount * (this.feePct / 100);
 
     try {
-      await ctx.replyWithHTML(`⏳ <b>Buying on ${info.emoji} ${info.name}...</b>\nAmount: ${buyAmount} ${info.currency} | Fee: ${fee.toFixed(4)}`);
-      const result = await this.engine.buyToken(ctx.from.id, mint, buyAmount);
+      await ctx.replyWithHTML(
+        `⏳ <b>Buying on ${meta.emoji} ${meta.name}...</b>\n` +
+        `Amount: ${buyAmount} ${meta.currency} | Fee: ${fee.toFixed(4)}`
+      );
+      const result = await this.engine.buyToken(ctx.from.id, mint, buyAmount, chain);
 
-      const txUrl = CHAINS[info.chain].txUrl(result.signature);
       ctx.replyWithHTML(
-        `✅ <b>Bought!</b>\n\n` +
+        `✅ <b>Bought ${result.symbol || ''}</b>\n\n` +
         `<code>${mint}</code>\n` +
-        `Spent: ${buyAmount} ${info.currency}\n` +
-        `<a href="${txUrl}">View TX</a>`,
+        `Spent: ${buyAmount} ${meta.currency}\n` +
+        `<a href="${meta.txUrl(result.signature)}">View TX</a>`,
         this._sellButtons(mint)
       );
 
-      await this._collectFee(user, fee, info.chain);
+      await this._collectFee(user, fee, chain);
     } catch (err) {
-      ctx.reply(`❌ ${err.message}`);
+      ctx.replyWithHTML(`❌ ${err.message}`);
     }
   }
 
@@ -649,21 +941,13 @@ class TelegramBot {
     try { await ctx.deleteMessage(ctx.message.message_id).catch(() => {}); } catch {}
 
     try {
-      let wallet, updates;
-      if (chain === 'solana') {
-        wallet = this.walletManager.importSolanaWallet(key);
-        updates = {
-          sol_wallet_address: wallet.publicKey,
-          sol_wallet_key_encrypted: this.walletManager.encrypt(key),
-        };
-      } else {
-        wallet = this.walletManager.importEvmWallet(key);
-        updates = {
-          evm_wallet_address: wallet.publicKey,
-          evm_wallet_key_encrypted: this.walletManager.encrypt(key),
-        };
-      }
+      const wallet = this.walletManager.importWallet(chain, key);
+      const updates = chain === 'solana'
+        ? { sol_wallet_address: wallet.publicKey, sol_wallet_key_encrypted: wallet.encrypted }
+        : { evm_wallet_address: wallet.publicKey, evm_wallet_key_encrypted: wallet.encrypted };
       await db.updateUser(ctx.from.id, updates);
+      // Drop any signer cached under the old key for this user.
+      this.walletManager.forget(ctx.from.id);
       const info = CHAINS[chain];
 
       ctx.replyWithHTML(
@@ -683,10 +967,17 @@ class TelegramBot {
       const feeWallet = process.env.FEE_WALLET_ADDRESS;
       if (!feeWallet) return;
 
-      if (chain === 'solana' && user.sol_wallet_key_encrypted) {
-        await this.walletManager.withdrawSolana(user.sol_wallet_key_encrypted, feeWallet, feeAmount);
+      const enc = chain === 'solana' ? user.sol_wallet_key_encrypted : user.evm_wallet_key_encrypted;
+      if (!enc) return;
+      // Fee wallets are per-chain: an EVM address cannot receive SOL.
+      const chainFeeWallet = chain === 'solana'
+        ? (process.env.FEE_WALLET_ADDRESS_SOL || feeWallet)
+        : (process.env.FEE_WALLET_ADDRESS_EVM || null);
+      if (!chainFeeWallet || !this.walletManager.isValidAddress(chain, chainFeeWallet)) {
+        logger.warn(`[fee] no valid ${chain} fee wallet configured — logging fee only`);
+      } else {
+        await this.walletManager.withdrawNative(chain, enc, chainFeeWallet, feeAmount);
       }
-      // For Robinhood chain, fees would go to an EVM fee wallet (TODO: add EVM fee wallet)
 
       await db.query(
         `INSERT INTO fee_ledger (user_id, fee_amount, referrer_id, referrer_share) VALUES ($1, $2, $3, $4)`,
@@ -702,12 +993,13 @@ class TelegramBot {
       if (event.type !== 'close') return;
       try {
         const user = await db.getUser(event.userId);
+        const nativeUsd = await this.swap.getNativePriceUsd(event.chain || 'solana').catch(() => 0);
         const cardBuf = generateTradeCard({
           symbol: event.position.symbol || event.position.mint.slice(0, 8),
           name: event.position.mint,
           pnlPct: event.pnlPct,
           pnlSol: event.pnlSol,
-          pnlUsd: event.pnlSol * 150,
+          pnlUsd: event.pnlSol * nativeUsd,
           solInvested: event.position.sol_invested,
           solReceived: event.solReceived,
           peakMc: event.position.peak_mc,
@@ -736,9 +1028,10 @@ class TelegramBot {
     const returned = monthTrades.reduce((s, t) => s + (t.sol_received || 0), 0);
     const winners = monthTrades.filter(t => t.pnl_sol > 0);
     const sorted = [...monthTrades].sort((a, b) => b.pnl_pct - a.pnl_pct);
+    const nativeUsd = await this.swap.getNativePriceUsd('solana').catch(() => 0);
 
     const cardBuf = generateMonthlyCard({
-      totalPnlSol: totalPnl, totalPnlUsd: totalPnl * 150,
+      totalPnlSol: totalPnl, totalPnlUsd: totalPnl * nativeUsd,
       totalPnlPct: invested > 0 ? (totalPnl / invested) * 100 : 0,
       totalTrades: monthTrades.length, winRate: (winners.length / monthTrades.length) * 100,
       totalInvested: invested, totalReturned: returned,
@@ -752,8 +1045,23 @@ class TelegramBot {
     });
   }
 
-  async sendAlert(chatId, msg) {
-    try { await this.bot.telegram.sendMessage(chatId, msg, { parse_mode: 'HTML' }); } catch (e) { logger.error(`Alert failed: ${e.message}`); }
+  async sendAlert(chatId, msg, extra = {}) {
+    try {
+      await this.bot.telegram.sendMessage(chatId, msg, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...extra,
+      });
+    } catch (e) {
+      // 403 means the user blocked the bot — stop alerting them rather than
+      // retrying forever on every launch.
+      if (e.response?.error_code === 403) {
+        await db.updateUser(chatId, { alerts_enabled: false }).catch(() => {});
+        logger.warn(`[alert] ${chatId} blocked the bot — alerts disabled`);
+      } else {
+        logger.error(`Alert failed for ${chatId}: ${e.message}`);
+      }
+    }
   }
 
   async launch() {
