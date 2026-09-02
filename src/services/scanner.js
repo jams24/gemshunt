@@ -120,6 +120,10 @@ class Scanner {
   // ---------------------------------------------------------- Robinhood
 
   _startRobinhood() {
+    if (process.env.ROBINHOOD_SCANNER_ENABLED === 'false') {
+      logger.info('[scan] robinhood scanner disabled by config');
+      return;
+    }
     try {
       this.swap.adapter('robinhood').onNewPool(async ({ tokenAddress, poolId }) => {
         if (!this._markSeen(`rh:${poolId}`)) return;

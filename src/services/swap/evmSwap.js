@@ -1,6 +1,7 @@
 const { ethers } = require('ethers');
 const logger = require('../../utils/logger');
 const CHAINS = require('../chains');
+const { getEvmProvider } = require('../evmProvider');
 
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
@@ -46,7 +47,8 @@ class EvmSwapAdapter {
     this.config = chainConfig;
     this.chain = 'robinhood';
     this.nativeDecimals = 18;
-    this.provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl, chainConfig.chainId);
+    // Shared, throttled provider — see services/evmProvider.js.
+    this.provider = getEvmProvider(chainConfig);
     this._decimalsCache = new Map();
   }
 

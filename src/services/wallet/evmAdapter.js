@@ -1,6 +1,7 @@
 const { ethers } = require('ethers');
 const axios = require('axios');
 const logger = require('../../utils/logger');
+const { getEvmProvider } = require('../evmProvider');
 
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
@@ -19,7 +20,9 @@ class EvmAdapter {
     this.chain = 'robinhood';
     this.currency = chainConfig.currency || 'ETH';
     this.decimals = 18;
-    this.provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl, chainConfig.chainId);
+    // Same provider instance the swap adapter uses — two providers meant
+    // two independent polling loops against one rate-limited endpoint.
+    this.provider = getEvmProvider(chainConfig);
   }
 
   create() {

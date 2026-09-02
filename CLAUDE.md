@@ -81,6 +81,15 @@ The alerter additionally refuses to send anything below 50% confidence.
 
 ## RPC
 - Helius free tier (100K req/day) — WebSocket for pool detection
+- **Robinhood Chain's public RPC rate-limits hard.** All EVM traffic goes
+  through the single shared, throttled provider in `services/evmProvider.js`:
+  requests are serialised with a minimum spacing, 429s back off, and a breaker
+  pauses chain polling after repeated limits. Never construct a
+  `JsonRpcProvider` directly — use `getEvmProvider()`, or you reintroduce a
+  second independent polling loop. Ethers' own FetchRequest retry is capped at
+  1 attempt there; leaving it at the default made a single 429 block the caller
+  for minutes and surface as "exceeded maximum retry limit".
+  Set `ROBINHOOD_RPC_URL` to a private endpoint to avoid the limits entirely.
 - Market data is DexScreener's free endpoint. Robinhood Chain is **not indexed
   there**, so EVM tokens score on on-chain signals only and lean on the
   confidence shrinkage above.
