@@ -568,26 +568,15 @@ class TelegramBot {
         return this._handleImport(ctx, text);
       }
 
-      // Detect Solana address (base58, 32-44 chars)
+      // A pasted token address gets the full thesis — name, price, market cap,
+      // liquidity, safety and score — before any buy button is offered. The
+      // chain is inferred from the address format, so pasting a Robinhood
+      // token while on Solana just works instead of being ignored.
       if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
-        const user = await db.getUser(ctx.from.id);
-        if ((user.active_chain || 'solana') === 'solana' && user.sol_wallet_address) {
-          return ctx.replyWithHTML(
-            `<b>◎ Buy on Solana?</b>\n\n<code>${text}</code>`,
-            this._buyAmountButtons(text)
-          );
-        }
+        return this._sendAnalysis(ctx, text, 'solana');
       }
-
-      // Detect EVM address (0x...)
       if (/^0x[a-fA-F0-9]{40}$/.test(text)) {
-        const user = await db.getUser(ctx.from.id);
-        if ((user.active_chain) === 'robinhood' && user.evm_wallet_address) {
-          return ctx.replyWithHTML(
-            `<b>🪶 Buy on Robinhood Chain?</b>\n\n<code>${text}</code>`,
-            this._buyAmountButtons(text)
-          );
-        }
+        return this._sendAnalysis(ctx, text, 'robinhood');
       }
 
       // Keyboard buttons

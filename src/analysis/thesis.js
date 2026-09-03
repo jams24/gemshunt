@@ -11,6 +11,23 @@ function money(n) {
   return `$${n.toFixed(2)}`;
 }
 
+/** Token prices span many orders of magnitude; keep them readable. */
+function price(n) {
+  if (n == null) return '—';
+  if (n >= 1) return `$${n.toFixed(4)}`;
+  if (n >= 1e-6) return `$${n.toFixed(9).replace(/0+$/, '')}`;
+  return `$${n.toExponential(3)}`;
+}
+
+function compact(n) {
+  if (n == null) return '—';
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(Math.round(n));
+}
+
 function scoreBar(score) {
   const filled = Math.round(score / 10);
   return '█'.repeat(filled) + '░'.repeat(10 - filled);
@@ -53,11 +70,17 @@ function renderAlert(token, analysis) {
 
   const m = token.market || {};
   const stats = [];
+  if (token.priceUsd) stats.push(`Price ${price(token.priceUsd)}`);
   if (m.marketCap) stats.push(`MC ${money(m.marketCap)}`);
+  else if (token.marketCap) stats.push(`MC ${money(token.marketCap)}`);
   if (m.liquidityUsd) stats.push(`Liq ${money(m.liquidityUsd)}`);
-  else if (token.liquiditySol) stats.push(`Liq ${token.liquiditySol.toFixed(1)} ${meta.currency}`);
+  else if (token.liquiditySol) stats.push(`Liq ${token.liquiditySol.toFixed(2)} ${meta.currency}`);
   if (m.volume5m) stats.push(`Vol5m ${money(m.volume5m)}`);
   if (token.holderCount) stats.push(`${token.holderCount} holders`);
+  if (m.priceChange1h != null && m.priceChange1h !== 0) {
+    stats.push(`1h ${m.priceChange1h > 0 ? '+' : ''}${m.priceChange1h.toFixed(1)}%`);
+  }
+  if (token.totalSupply) stats.push(`Supply ${compact(token.totalSupply)}`);
   if (stats.length) lines.push(stats.join('  ·  '));
 
   const breakdown = Object.entries(categories || {})
@@ -102,4 +125,4 @@ function renderSmartMoneyAlert(token, wallets) {
   ].join('\n');
 }
 
-module.exports = { renderAlert, alertKeyboard, renderSmartMoneyAlert, money, scoreBar, scoreEmoji, esc };
+module.exports = { renderAlert, alertKeyboard, renderSmartMoneyAlert, money, price, compact, scoreBar, scoreEmoji, esc };

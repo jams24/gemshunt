@@ -52,7 +52,15 @@ class MarketData {
       // Deepest pool is the honest one — thin side-pools give garbage prices.
       const pair = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
 
+      // The pair carries the token's name and symbol, which neither the RPC
+      // nor the SPL mint account provides on Solana.
+      const base = pair.baseToken?.address?.toLowerCase() === mint.toLowerCase()
+        ? pair.baseToken
+        : pair.quoteToken;
+
       return this._store(key, {
+        symbol: base?.symbol || null,
+        name: base?.name || null,
         priceUsd: parseFloat(pair.priceUsd) || null,
         priceNative: parseFloat(pair.priceNative) || null,
         liquidityUsd: pair.liquidity?.usd || 0,

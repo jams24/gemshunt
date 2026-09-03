@@ -23,6 +23,10 @@ const CHAINS = {
     positionManager: '0x58daec3116aae6D93017bAAea7749052E8a04fA7',
     permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
     weth: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+    // Uniswap V4 represents native ETH as address(0), not WETH. Most pools on
+    // this chain pair against native ETH, so this — not `weth` — is the
+    // currency to build pool keys against.
+    nativeCurrency: '0x0000000000000000000000000000000000000000',
     bagsFactory: '0xe8Cc4431adF8b5A847C113EF0c6af9043219Cb37',
   },
 };

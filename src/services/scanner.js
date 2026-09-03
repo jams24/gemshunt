@@ -125,9 +125,9 @@ class Scanner {
       return;
     }
     try {
-      this.swap.adapter('robinhood').onNewPool(async ({ tokenAddress, poolId }) => {
+      this.swap.adapter('robinhood').onNewPool(async ({ tokenAddress, poolId, poolKey }) => {
         if (!this._markSeen(`rh:${poolId}`)) return;
-        logger.info(`[scan] robinhood pool ${tokenAddress}`);
+        logger.info(`[scan] robinhood pool ${tokenAddress} fee=${poolKey.fee} spacing=${poolKey.tickSpacing}`);
         await this._emit({
           chain: 'robinhood',
           mint: tokenAddress,
@@ -135,6 +135,7 @@ class Scanner {
           poolAddress: poolId,
           dex: 'uniswap-v4',
           liquidityNative: null,
+          poolKey,
         });
       });
     } catch (err) {

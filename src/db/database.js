@@ -158,6 +158,9 @@ async function migrate(client) {
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS peak_multiple DOUBLE PRECISION;
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS outcome TEXT;
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS tracking_until TIMESTAMPTZ;
+    -- The exact Uniswap V4 PoolKey seen in the Initialize event. Fee and
+    -- tickSpacing vary per pool, so quotes are impossible without it.
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS pool_key JSONB;
   `);
 
   // The old tokens table had UNIQUE(mint) only. Two chains can theoretically
@@ -296,8 +299,8 @@ async function saveToken(token) {
        chain, mint, symbol, name, deployer, pool_address, dex, liquidity_sol, initial_mc,
        lp_locked, mint_authority_revoked, freeze_authority_revoked, top_holder_pct, is_safe,
        decimals, total_supply, holder_count, dev_holding_pct, lp_burned_pct, honeypot,
-       score, score_breakdown, thesis, socials, tracking_until)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+       score, score_breakdown, thesis, socials, tracking_until, pool_key)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
      ON CONFLICT (chain, mint) DO UPDATE SET
        symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
        name = COALESCE(EXCLUDED.name, tokens.name),
@@ -318,7 +321,8 @@ async function saveToken(token) {
        score_breakdown = EXCLUDED.score_breakdown,
        thesis = EXCLUDED.thesis,
        socials = EXCLUDED.socials,
-       tracking_until = EXCLUDED.tracking_until
+       tracking_until = EXCLUDED.tracking_until,
+       pool_key = COALESCE(EXCLUDED.pool_key, tokens.pool_key)
      RETURNING *`,
     [chain, token.mint, token.symbol, token.name, token.deployer, token.poolAddress,
      token.dex || 'raydium', token.liquiditySol, token.initialMc,
@@ -327,7 +331,8 @@ async function saveToken(token) {
      token.holderCount, token.devHoldingPct, token.lpBurnedPct, token.honeypot,
      token.score, token.scoreBreakdown ? JSON.stringify(token.scoreBreakdown) : null,
      token.thesis, token.socials ? JSON.stringify(token.socials) : null,
-     token.trackingUntil || null]
+     token.trackingUntil || null,
+     token.poolKey ? JSON.stringify(token.poolKey) : null]
   );
   return rows[0];
 }

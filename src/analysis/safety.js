@@ -20,7 +20,7 @@ class SafetyChecker {
     this.swap = swapRouter;
   }
 
-  async check(chain, mint) {
+  async check(chain, mint, poolKey) {
     const base = {
       mintAuthorityRevoked: null,
       freezeAuthorityRevoked: null,
@@ -31,6 +31,7 @@ class SafetyChecker {
       lpLocked: null,
       honeypot: null,
       sellTaxPct: null,
+      poolFeePct: null,
       decimals: null,
       totalSupply: null,
       flags: [],
@@ -46,13 +47,24 @@ class SafetyChecker {
       base.flags.push('safety check errored');
     }
 
-    // Sellability probe is identical in intent on both chains.
+    // Sellability probe is identical in intent on both chains. Three outcomes,
+    // and the third matters: true (sellable), false (honeypot), and null
+    // (could not determine). Treating null as a honeypot condemned every token
+    // whose pool we could not quote.
     try {
-      const sellable = await this.swap.checkSellable(chain, mint, base.decimals || 9);
-      base.honeypot = sellable.sellable === false;
+      const sellable = await this.swap.checkSellable(chain, mint, base.decimals || 9, poolKey);
+      base.honeypot = sellable.sellable === null ? null : sellable.sellable === false;
       base.sellTaxPct = sellable.roundTripLossPct ?? null;
-      if (base.honeypot) base.flags.push(`cannot sell: ${sellable.reason}`);
+      base.poolFeePct = sellable.feePct ?? null;
+      // V4 launch pools routinely open at a 50-80% fee that decays. Worth
+      // naming explicitly — a buyer needs a big move just to break even.
+      if (base.poolFeePct != null && base.poolFeePct > 10) {
+        base.flags.push(`pool fee is ${base.poolFeePct.toFixed(1)}% per swap`);
+      }
+      if (base.honeypot === true) base.flags.push(`cannot sell: ${sellable.reason}`);
+      if (base.honeypot === null) base.flags.push(`sellability unverified (${sellable.reason})`);
     } catch (err) {
+      base.honeypot = null;
       base.flags.push('sellability probe failed');
     }
 

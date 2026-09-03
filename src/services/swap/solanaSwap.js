@@ -3,8 +3,15 @@ const { VersionedTransaction, PublicKey } = require('@solana/web3.js');
 const logger = require('../../utils/logger');
 
 const WSOL = 'So11111111111111111111111111111111111111112';
-const JUPITER_API = 'https://quote-api.jup.ag/v6';
-const JUPITER_PRICE = 'https://api.jup.ag/price/v2';
+// Jupiter retired quote-api.jup.ag/v6 and price.jup.ag — the former now fails
+// to connect and the latter no longer resolves at all. The current free
+// endpoints are lite-api.jup.ag; api.jup.ag is the same API behind a key.
+const JUPITER_HOST = process.env.JUPITER_API_KEY ? 'https://api.jup.ag' : 'https://lite-api.jup.ag';
+const JUPITER_API = `${JUPITER_HOST}/swap/v1`;
+const JUPITER_PRICE = `${JUPITER_HOST}/price/v3`;
+const JUPITER_HEADERS = process.env.JUPITER_API_KEY
+  ? { 'x-api-key': process.env.JUPITER_API_KEY }
+  : {};
 
 /**
  * Solana swap adapter (Jupiter v6). Amounts crossing this boundary are always
@@ -27,6 +34,7 @@ class SolanaSwapAdapter {
         onlyDirectRoutes: false,
       },
       timeout: 10000,
+      headers: JUPITER_HEADERS,
     });
     return {
       inAmount: Number(data.inAmount),
@@ -45,7 +53,7 @@ class SolanaSwapAdapter {
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
       prioritizationFeeLamports: 'auto',
-    }, { timeout: 15000 });
+    }, { timeout: 15000, headers: JUPITER_HEADERS });
 
     const tx = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
     tx.sign([signer]);
@@ -76,8 +84,13 @@ class SolanaSwapAdapter {
   /** Price in USD, or null if Jupiter has no route yet. */
   async getPrice(mint) {
     try {
-      const { data } = await axios.get(JUPITER_PRICE, { params: { ids: mint }, timeout: 5000 });
-      const p = data?.data?.[mint]?.price;
+      const { data } = await axios.get(JUPITER_PRICE, {
+        params: { ids: mint }, timeout: 5000, headers: JUPITER_HEADERS,
+      });
+      // price/v3 returns { <mint>: { usdPrice, decimals, ... } } — flatter
+      // than v2's { data: { <mint>: { price } } }.
+      const entry = data?.[mint] ?? data?.data?.[mint];
+      const p = entry?.usdPrice ?? entry?.price;
       return p ? Number(p) : null;
     } catch {
       return null;
@@ -112,23 +125,37 @@ class SolanaSwapAdapter {
    * SOL; if no route exists or the quote round-trips at a catastrophic loss,
    * the token is effectively a honeypot. Costs nothing — quote only, no tx.
    */
+  /**
+   * Sellability probe. Returns sellable:null for UNKNOWN — an API failure is
+   * not evidence of a honeypot, and treating it as one condemned every token
+   * the moment Jupiter's endpoint moved.
+   */
   async checkSellable(mint, decimals = 9) {
+    let buyQuote;
     try {
-      const probe = Math.floor(10 ** decimals); // 1 whole token
-      const buyQuote = await this.quote(WSOL, mint, 1e8, 1500); // 0.1 SOL in
-      if (!buyQuote.outAmount) return { sellable: false, reason: 'no buy route' };
+      buyQuote = await this.quote(WSOL, mint, 1e8, 1500); // 0.1 SOL in
+    } catch (err) {
+      // No route yet is normal for a pool seconds old; a network error tells
+      // us nothing about the token. Either way: unknown, not guilty.
+      return { sellable: null, reason: `buy probe failed: ${err.message}` };
+    }
+    if (!buyQuote.outAmount) return { sellable: null, reason: 'no buy route yet' };
 
-      const sellQuote = await this.quote(mint, WSOL, Math.min(buyQuote.outAmount, probe * 1e6), 1500);
-      if (!sellQuote.outAmount) return { sellable: false, reason: 'no sell route' };
-
+    try {
+      const sellQuote = await this.quote(mint, WSOL, buyQuote.outAmount, 1500);
+      if (!sellQuote.outAmount) {
+        return { sellable: false, reason: 'no sell route while a buy route exists' };
+      }
       const roundTripLoss = 1 - (sellQuote.outAmount / 1e8);
       return {
-        sellable: roundTripLoss < 0.9,
+        sellable: true,
         roundTripLossPct: roundTripLoss * 100,
-        reason: roundTripLoss >= 0.9 ? 'round-trip loses >90%' : null,
+        reason: null,
       };
     } catch (err) {
-      return { sellable: false, reason: `probe failed: ${err.message}` };
+      // A buy route exists but the sell quote errors — that asymmetry is the
+      // actual honeypot signature.
+      return { sellable: false, reason: `sell quote failed: ${err.message}` };
     }
   }
 }

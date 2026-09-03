@@ -62,6 +62,36 @@ Two rules matter more than the weights:
 
 The alerter additionally refuses to send anything below 50% confidence.
 
+## Chain gotchas that caused real outages
+
+- **Uniswap V4 pool keys cannot be guessed.** Fee and tickSpacing vary per pool
+  (observed: fee 2500/9000/38000/810000/813690, spacing 25/60/90/200/19988), and
+  most pools pair against **native ETH `address(0)`, not WETH**. The key is only
+  learned from the `Initialize` event, so the scanner records it and it is
+  persisted in `tokens.pool_key`. A wrong key addresses a pool that does not
+  exist and every quote reverts.
+- **`V4Quoter.quoteExactInputSingle` takes no `poolManager` field.** Its struct
+  is `{PoolKey, bool, uint128, bytes}`. Adding one changes the selector to
+  0xc10cb6f6, which the deployed contract does not implement, so every call
+  reverts with no data.
+- **V4 fees are hundredths of a bip**, so `fee: 813690` is an 81% swap fee —
+  normal for a launch pool whose fee decays. That is a tax, not a honeypot.
+- **Jupiter retired `quote-api.jup.ag/v6` and `price.jup.ag`.** Current free
+  endpoints are `lite-api.jup.ag/swap/v1` and `lite-api.jup.ag/price/v3`
+  (note: v3 returns `usdPrice` at the top level, not `data[mint].price`).
+- **Alchemy's free tier caps `eth_getLogs` to a 10-block range**, so historical
+  log scans need paging; live subscriptions are unaffected.
+
+## Sellability is three-valued
+
+`checkSellable` returns `true`, `false`, or **`null` for unknown**, and
+`safety.honeypot` carries the same three states. Never collapse null into
+false. Both chains once did, and the result was that *every* token scored 0 as
+a honeypot the moment an endpoint moved or a pool key was wrong — the bot went
+completely silent while looking like it was working. A failed probe degrades
+confidence; only a sell quote that reverts while a buy quote succeeds is a
+honeypot.
+
 ## Invariants
 
 - **Token amounts are raw integers**, stored as `NUMERIC` (`token_amount_raw`)

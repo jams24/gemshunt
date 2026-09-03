@@ -42,18 +42,30 @@ class SwapRouter {
   }
 
   /** USD price per whole token, or null when there's no route. */
-  async getPrice(chain, mint) {
+  async getPrice(chain, mint, poolKey) {
     if (chain === 'solana') return this.adapter(chain).getPrice(mint);
     const nativeUsd = await this.getNativePriceUsd(chain);
-    return this.adapter(chain).getPrice(mint, nativeUsd);
+    return this.adapter(chain).getPrice(mint, nativeUsd, poolKey);
   }
 
   async getTokenInfo(chain, mint) {
     return this.adapter(chain).getTokenInfo(mint);
   }
 
-  async checkSellable(chain, mint, decimals) {
-    return this.adapter(chain).checkSellable(mint, decimals);
+  async checkSellable(chain, mint, decimals, poolKey) {
+    return this.adapter(chain).checkSellable(mint, decimals, poolKey);
+  }
+
+  /** Native-side pool depth, where the adapter can measure it. */
+  async getLiquidityEstimate(chain, mint, poolKey) {
+    const adapter = this.adapter(chain);
+    return adapter.getLiquidityEstimate ? adapter.getLiquidityEstimate(mint, poolKey) : null;
+  }
+
+  /** Record a pool key discovered by the scanner so later quotes can use it. */
+  rememberPool(chain, mint, poolKey) {
+    const adapter = this.adapter(chain);
+    adapter.rememberPool?.(mint, poolKey);
   }
 
   async getNativePriceUsd(chain) {

@@ -17,31 +17,47 @@ class Analyzer {
     this.swap = swapRouter;
   }
 
-  async analyze({ chain, mint, deployer, poolAddress, dex, liquidityNative, symbol, name }) {
+  async analyze({ chain, mint, deployer, poolAddress, dex, liquidityNative, symbol, name, poolKey }) {
     const started = Date.now();
 
-    const [safety, market, nativePriceUsd, tokenInfo, watcherBuys] = await Promise.all([
-      this.safety.check(chain, mint),
+    // A V4 pool key cannot be derived, only observed. Fall back to one stored
+    // from a previous sighting so /scan works on tokens we saw earlier.
+    let key = poolKey;
+    if (!key && chain !== 'solana') {
+      const stored = await this.db.getToken(chain, mint).catch(() => null);
+      key = stored?.pool_key || null;
+      if (key) this.swap.rememberPool(chain, mint, key);
+    }
+
+    const [safety, market, nativePriceUsd, tokenInfo, watcherBuys, depth, quotedPrice] = await Promise.all([
+      this.safety.check(chain, mint, key),
       this.market.getPairData(chain, mint),
       this.swap.getNativePriceUsd(chain).catch(() => null),
       this.swap.getTokenInfo(chain, mint).catch(() => null),
       this.db.countWatchersBought(chain, mint, 60).catch(() => 0),
+      // No indexer covers Robinhood Chain, so measure pool depth from price
+      // impact instead. Without it these tokens have only one scored category
+      // and never clear the confidence gate.
+      this.swap.getLiquidityEstimate(chain, mint, key).catch(() => null),
+      this.swap.getPrice(chain, mint, key).catch(() => null),
     ]);
+
+    const liquidity = liquidityNative ?? depth;
 
     const analysis = await this.scorer.score({
       chain, mint, deployer, safety, market,
-      liquidityNative, nativePriceUsd, watcherBuys,
+      liquidityNative: liquidity, nativePriceUsd, watcherBuys,
     });
 
     const token = {
       chain,
       mint,
-      symbol: symbol || tokenInfo?.symbol || 'UNKNOWN',
-      name: name || tokenInfo?.name || null,
+      symbol: symbol || market?.symbol || tokenInfo?.symbol || 'UNKNOWN',
+      name: name || market?.name || tokenInfo?.name || null,
       deployer,
       poolAddress,
       dex,
-      liquiditySol: liquidityNative,
+      liquiditySol: liquidity,
       initialMc: market?.marketCap ?? null,
       decimals: safety.decimals ?? tokenInfo?.decimals ?? null,
       totalSupply: safety.totalSupply ?? tokenInfo?.totalSupply ?? null,
@@ -63,6 +79,12 @@ class Analyzer {
       },
       thesis: analysis.verdict,
       socials: market?.socials || null,
+      poolKey: key || null,
+      priceUsd: market?.priceUsd ?? quotedPrice ?? null,
+      marketCap: market?.marketCap
+        ?? ((market?.priceUsd ?? quotedPrice) && (safety.totalSupply ?? tokenInfo?.totalSupply)
+            ? (market?.priceUsd ?? quotedPrice) * (safety.totalSupply ?? tokenInfo?.totalSupply)
+            : null),
       market,
       watcherBuys,
     };

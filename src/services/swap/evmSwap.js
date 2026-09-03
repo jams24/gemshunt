@@ -23,8 +23,14 @@ const UNIVERSAL_ROUTER_ABI = [
   'function execute(bytes commands, bytes[] inputs, uint256 deadline) payable',
 ];
 
+// V4Quoter.quoteExactInputSingle takes QuoteExactSingleParams, which is
+// { PoolKey poolKey, bool zeroForOne, uint128 exactAmount, bytes hookData }.
+// There is NO poolManager field — including one produces a different selector
+// (0xc10cb6f6 instead of 0xaa9d21cb) that the deployed contract does not
+// implement, so every call reverted with no data. Verified against the
+// deployed bytecode.
 const V4_QUOTER_ABI = [
-  'function quoteExactInputSingle((address poolManager, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bool zeroForOne, uint128 exactAmount, bytes hookData)) view returns (uint256 amountOut, uint256 gasEstimate)',
+  'function quoteExactInputSingle(((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bool zeroForOne, uint128 exactAmount, bytes hookData)) returns (uint256 amountOut, uint256 gasEstimate)',
 ];
 
 const POOL_MANAGER_ABI = [
@@ -35,13 +41,21 @@ const V4_SWAP = 0x10;
 const SWAP_EXACT_IN_SINGLE = 0x06;
 const SETTLE_ALL = 0x0e;
 const TAKE_ALL = 0x0f;
-const POOL_FEE = 3000;
-const TICK_SPACING = 60;
+const ZERO = '0x0000000000000000000000000000000000000000';
 
 /**
  * Robinhood Chain swap adapter (Uniswap V4 via UniversalRouter).
  * Mirrors SolanaSwapAdapter's interface: raw amounts in, raw amounts out.
  */
+/** Thrown when a token's V4 pool key has not been observed, so it cannot be quoted. */
+class PoolUnknownError extends Error {
+  constructor(token) {
+    super(`No known V4 pool for ${token}`);
+    this.name = 'PoolUnknownError';
+    this.poolUnknown = true;
+  }
+}
+
 class EvmSwapAdapter {
   constructor(chainConfig = CHAINS.robinhood) {
     this.config = chainConfig;
@@ -50,23 +64,55 @@ class EvmSwapAdapter {
     // Shared, throttled provider — see services/evmProvider.js.
     this.provider = getEvmProvider(chainConfig);
     this._decimalsCache = new Map();
+    this._pools = new Map();
   }
 
-  _poolKey(tokenAddress) {
-    const weth = this.config.weth;
-    const tokenFirst = tokenAddress.toLowerCase() < weth.toLowerCase();
+  /**
+   * Remember the exact PoolKey seen in a pool's Initialize event.
+   *
+   * V4 pool keys are NOT guessable. Observed fees on this chain include 9000,
+   * 810000 and 813690, and tick spacings 90, 200 and 19988 — nothing like the
+   * 3000/60 this code used to assume. A key that is even slightly wrong
+   * addresses a pool that does not exist, so every quote reverts. That made
+   * the sellability probe report *every* token as a honeypot.
+   */
+  rememberPool(tokenAddress, poolKey) {
+    if (!tokenAddress || !poolKey) return;
+    this._pools.set(tokenAddress.toLowerCase(), poolKey);
+  }
+
+  knownPool(tokenAddress) {
+    return this._pools.get(tokenAddress?.toLowerCase()) || null;
+  }
+
+  /**
+   * Build the V4 pool key for a token, or null when it is not known. Callers
+   * must treat null as "cannot quote", never as "cannot sell".
+   */
+  _poolKey(tokenAddress, override) {
+    const key = override || this.knownPool(tokenAddress);
+    if (!key) return null;
+
+    const token = tokenAddress.toLowerCase();
+    const tokenIsCurrency0 = key.currency0.toLowerCase() === token;
     return {
-      currency0: tokenFirst ? tokenAddress : weth,
-      currency1: tokenFirst ? weth : tokenAddress,
-      tokenIsCurrency0: tokenFirst,
+      currency0: key.currency0,
+      currency1: key.currency1,
+      fee: Number(key.fee),
+      tickSpacing: Number(key.tickSpacing),
+      hooks: key.hooks || ZERO,
+      tokenIsCurrency0,
+      // The other side of the pair — native ETH (address(0)) for most pools
+      // on this chain, occasionally WETH.
+      nativeCurrency: tokenIsCurrency0 ? key.currency1 : key.currency0,
     };
   }
 
-  _encodeSwap({ currency0, currency1 }, zeroForOne, amountIn, minOut, settleCurrency, takeCurrency) {
+  _encodeSwap(pk, zeroForOne, amountIn, minOut, settleCurrency, takeCurrency) {
     const coder = ethers.AbiCoder.defaultAbiCoder();
     const swapAction = coder.encode(
       ['tuple(address,address,uint24,int24,address)', 'bool', 'uint128', 'uint128', 'bytes'],
-      [[currency0, currency1, POOL_FEE, TICK_SPACING, ethers.ZeroAddress], zeroForOne, amountIn, minOut, '0x']
+      [[pk.currency0, pk.currency1, pk.fee, pk.tickSpacing, pk.hooks], zeroForOne, amountIn, minOut, '0x']
     );
     const settleAction = coder.encode(['address', 'uint256'], [settleCurrency, amountIn]);
     const takeAction = coder.encode(['address', 'uint128'], [takeCurrency, minOut]);
@@ -89,14 +135,16 @@ class EvmSwapAdapter {
   }
 
   /** Quote via the V4 quoter. amountIn/out are RAW units. */
-  async quote(tokenAddress, rawAmountIn, isBuy) {
-    const { currency0, currency1, tokenIsCurrency0 } = this._poolKey(tokenAddress);
-    // Buying the token means selling WETH, so zeroForOne is true when WETH is currency0.
-    const zeroForOne = isBuy ? !tokenIsCurrency0 : tokenIsCurrency0;
+  async quote(tokenAddress, rawAmountIn, isBuy, poolKeyOverride) {
+    const pk = this._poolKey(tokenAddress, poolKeyOverride);
+    if (!pk) throw new PoolUnknownError(tokenAddress);
+
+    // Buying the token means spending the native side, so zeroForOne is true
+    // when the native currency is currency0.
+    const zeroForOne = isBuy ? !pk.tokenIsCurrency0 : pk.tokenIsCurrency0;
     const quoter = new ethers.Contract(this.config.v4Quoter, V4_QUOTER_ABI, this.provider);
     const [amountOut] = await quoter.quoteExactInputSingle.staticCall([
-      this.config.poolManager,
-      [currency0, currency1, POOL_FEE, TICK_SPACING, ethers.ZeroAddress],
+      [pk.currency0, pk.currency1, pk.fee, pk.tickSpacing, pk.hooks],
       zeroForOne,
       rawAmountIn,
       '0x',
@@ -113,17 +161,20 @@ class EvmSwapAdapter {
     const wallet = signer.connect ? signer.connect(this.provider) : signer;
     const amountIn = ethers.parseEther(nativeAmount.toString());
 
+    const pk = this._poolKey(tokenAddress);
+    if (!pk) throw new PoolUnknownError(tokenAddress);
+
     let minOut = 0n;
     try {
-      const q = await this.quote(tokenAddress, amountIn, true);
+      const q = await this.quote(tokenAddress, amountIn, true, pk);
       minOut = (q.rawOut * BigInt(10000 - slippageBps)) / 10000n;
     } catch (err) {
       logger.warn(`[rh] quote failed, sending with no minOut: ${err.message}`);
     }
 
-    const poolKey = this._poolKey(tokenAddress);
-    const zeroForOne = !poolKey.tokenIsCurrency0;
-    const input = this._encodeSwap(poolKey, zeroForOne, amountIn, minOut, this.config.weth, tokenAddress);
+    const zeroForOne = !pk.tokenIsCurrency0;
+    // Settle the native side of THIS pool — address(0) for native ETH pools.
+    const input = this._encodeSwap(pk, zeroForOne, amountIn, minOut, pk.nativeCurrency, tokenAddress);
 
     const token = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
     const before = await token.balanceOf(wallet.address);
@@ -169,17 +220,19 @@ class EvmSwapAdapter {
       )).wait();
     }
 
+    const pk = this._poolKey(tokenAddress);
+    if (!pk) throw new PoolUnknownError(tokenAddress);
+
     let minOut = 0n;
     try {
-      const q = await this.quote(tokenAddress, amountIn, false);
+      const q = await this.quote(tokenAddress, amountIn, false, pk);
       minOut = (q.rawOut * BigInt(10000 - slippageBps)) / 10000n;
     } catch (err) {
       logger.warn(`[rh] sell quote failed: ${err.message}`);
     }
 
-    const poolKey = this._poolKey(tokenAddress);
-    const zeroForOne = poolKey.tokenIsCurrency0;
-    const input = this._encodeSwap(poolKey, zeroForOne, amountIn, minOut, tokenAddress, this.config.weth);
+    const zeroForOne = pk.tokenIsCurrency0;
+    const input = this._encodeSwap(pk, zeroForOne, amountIn, minOut, tokenAddress, pk.nativeCurrency);
 
     const ethBefore = await this.provider.getBalance(wallet.address);
     const router = new ethers.Contract(this.config.universalRouter, UNIVERSAL_ROUTER_ABI, wallet);
@@ -202,10 +255,10 @@ class EvmSwapAdapter {
   }
 
   /** Price in USD per whole token. */
-  async getPrice(tokenAddress, nativePriceUsd) {
+  async getPrice(tokenAddress, nativePriceUsd, poolKey) {
     try {
       const probe = ethers.parseEther('0.01');
-      const q = await this.quote(tokenAddress, probe, true);
+      const q = await this.quote(tokenAddress, probe, true, poolKey);
       if (!q.outAmount) return null;
       const decimals = await this.getDecimals(tokenAddress);
       const tokensOut = Number(ethers.formatUnits(q.rawOut, decimals));
@@ -247,23 +300,68 @@ class EvmSwapAdapter {
    * Sellability probe using quoter round-trip. Quote-only, costs no gas.
    * A token that quotes a buy but cannot quote a sell is a honeypot.
    */
-  async checkSellable(tokenAddress) {
+  /**
+   * Sellability probe. `sellable: null` means UNKNOWN — the pool could not be
+   * reached — and must never be scored as a honeypot. Conflating those two
+   * marked every token on this chain unsellable.
+   */
+  async checkSellable(tokenAddress, _decimals, poolKey) {
+    const pk = this._poolKey(tokenAddress, poolKey);
+    if (!pk) return { sellable: null, reason: 'pool key unknown — cannot probe' };
+
     try {
       const probe = ethers.parseEther('0.01');
-      const buyQ = await this.quote(tokenAddress, probe, true);
-      if (!buyQ.outAmount) return { sellable: false, reason: 'no buy route' };
+      const buyQ = await this.quote(tokenAddress, probe, true, pk);
+      if (!buyQ.outAmount) return { sellable: null, reason: 'buy quote returned nothing' };
 
-      const sellQ = await this.quote(tokenAddress, buyQ.rawOut, false);
+      const sellQ = await this.quote(tokenAddress, buyQ.rawOut, false, pk);
       if (!sellQ.outAmount) return { sellable: false, reason: 'sell quote reverts (honeypot)' };
 
+      // A large round-trip loss is a TAX, not a honeypot. V4 fees are in
+      // hundredths of a bip, so fee=813690 is an 81% swap fee — common on
+      // launches where the fee decays over the first minutes. The token is
+      // genuinely sellable; it is just expensive right now. Report it as tax
+      // and let scoring penalise it, rather than condemning it outright.
       const roundTripLoss = 1 - (sellQ.outAmount / Number(probe));
       return {
-        sellable: roundTripLoss < 0.9,
+        sellable: true,
         roundTripLossPct: roundTripLoss * 100,
-        reason: roundTripLoss >= 0.9 ? 'round-trip loses >90% (high sell tax)' : null,
+        feePct: pk.fee / 10000,
+        reason: null,
       };
     } catch (err) {
-      return { sellable: false, reason: `probe reverted: ${err.message}` };
+      // A revert is ambiguous: honeypot, or a pool not initialised yet.
+      // Report unknown and let confidence carry the doubt.
+      return { sellable: null, reason: `probe failed: ${err.shortMessage || err.message}` };
+    }
+  }
+
+  /**
+   * Estimate the pool's native-side depth from price impact. For a constant
+   * product pool, buying x of the native side moves price by roughly x/reserve,
+   * so reserve ~= x / impact. Rough, but it is the only liquidity signal
+   * available on a chain no indexer covers.
+   */
+  async getLiquidityEstimate(tokenAddress, poolKey) {
+    const pk = this._poolKey(tokenAddress, poolKey);
+    if (!pk) return null;
+    try {
+      const small = ethers.parseEther('0.01');
+      const large = ethers.parseEther('1');
+      const [qs, ql] = await Promise.all([
+        this.quote(tokenAddress, small, true, pk),
+        this.quote(tokenAddress, large, true, pk),
+      ]);
+      if (!qs.outAmount || !ql.outAmount) return null;
+
+      const rateSmall = qs.outAmount / Number(small);
+      const rateLarge = ql.outAmount / Number(large);
+      const impact = 1 - rateLarge / rateSmall;
+      if (!(impact > 0)) return null;      // deeper than the probe can measure
+      if (impact >= 0.999) return 0;       // essentially no liquidity
+      return 1 / impact;                   // native-side reserve, in ETH
+    } catch {
+      return null;
     }
   }
 
@@ -279,9 +377,22 @@ class EvmSwapAdapter {
       const weth = this.config.weth.toLowerCase();
       const c0 = currency0.toLowerCase();
       const c1 = currency1.toLowerCase();
-      if (c0 !== weth && c1 !== weth) return;
-      const tokenAddress = c0 === weth ? currency1 : currency0;
-      await callback({ tokenAddress, poolId: id, fee: Number(fee), hooks });
+
+      // Pools pair against native ETH (address(0)) far more often than WETH.
+      const isNative = (a) => a === ZERO || a === weth;
+      if (!isNative(c0) && !isNative(c1)) return;
+
+      const tokenAddress = isNative(c0) ? currency1 : currency0;
+      if (tokenAddress.toLowerCase() === ZERO) return; // both sides native
+
+      const poolKey = {
+        currency0, currency1,
+        fee: Number(fee),
+        tickSpacing: Number(tickSpacing),
+        hooks,
+      };
+      this.rememberPool(tokenAddress, poolKey);
+      await callback({ tokenAddress, poolId: id, poolKey });
     };
 
     const wsUrl = getEvmWsUrl(this.config);
@@ -314,3 +425,4 @@ class EvmSwapAdapter {
 }
 
 module.exports = EvmSwapAdapter;
+module.exports.PoolUnknownError = PoolUnknownError;
