@@ -6,11 +6,9 @@ const PUMPSWAP_AMM = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'
 const PUMP_FUN = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const WSOL = 'So11111111111111111111111111111111111111112';
 const SEEN_MAX = 5000;
+const MAX_CONCURRENT = 3;
+const QUEUE_MAX = 50;
 
-/**
- * Watches every configured chain for new pools and emits one uniform token
- * event, so downstream code never learns which chain it came from.
- */
 class Scanner {
   constructor({ connection, swapRouter, db }) {
     this.connection = connection;
@@ -19,6 +17,24 @@ class Scanner {
     this.onNewToken = null;
     this.seen = new Set();
     this.subscriptions = [];
+    this._queue = [];
+    this._active = 0;
+  }
+
+  _enqueue(fn) {
+    if (this._queue.length >= QUEUE_MAX) {
+      this._queue.shift();
+    }
+    this._queue.push(fn);
+    this._drain();
+  }
+
+  async _drain() {
+    while (this._active < MAX_CONCURRENT && this._queue.length) {
+      this._active++;
+      const job = this._queue.shift();
+      job().finally(() => { this._active--; this._drain(); });
+    }
   }
 
   _markSeen(key) {
@@ -54,28 +70,30 @@ class Scanner {
       if (createCount < 2) return;
       if (!this._markSeen(`sol:ps:${logs.signature}`)) return;
 
-      try {
-        const tx = await this.connection.getParsedTransaction(logs.signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-        if (!tx) return;
+      this._enqueue(async () => {
+        try {
+          const tx = await this.connection.getParsedTransaction(logs.signature, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          });
+          if (!tx) return;
 
-        const pool = this._extractPumpSwapPool(tx);
-        if (!pool) return;
+          const pool = this._extractPumpSwapPool(tx);
+          if (!pool) return;
 
-        logger.info(`[scan] pumpswap pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
-        await this._emit({
-          chain: 'solana',
-          mint: pool.tokenMint,
-          deployer: pool.deployer,
-          poolAddress: pool.poolAddress,
-          dex: 'pumpswap',
-          liquidityNative: pool.liquiditySol,
-        });
-      } catch (err) {
-        logger.error(`[scan] pumpswap parse: ${err.message}`);
-      }
+          logger.info(`[scan] pumpswap pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
+          await this._emit({
+            chain: 'solana',
+            mint: pool.tokenMint,
+            deployer: pool.deployer,
+            poolAddress: pool.poolAddress,
+            dex: 'pumpswap',
+            liquidityNative: pool.liquiditySol,
+          });
+        } catch (err) {
+          logger.error(`[scan] pumpswap parse: ${err.message}`);
+        }
+      });
     }, 'confirmed');
     this.subscriptions.push(() => this.connection.removeOnLogsListener(pumpSwapId));
     logger.info('[scan] listening for PumpSwap pools (pump.fun graduates)');
@@ -86,28 +104,30 @@ class Scanner {
       if (!logs.logs.some(l => l.includes('initialize2'))) return;
       if (!this._markSeen(`sol:ray:${logs.signature}`)) return;
 
-      try {
-        const tx = await this.connection.getParsedTransaction(logs.signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-        if (!tx) return;
+      this._enqueue(async () => {
+        try {
+          const tx = await this.connection.getParsedTransaction(logs.signature, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          });
+          if (!tx) return;
 
-        const pool = this._extractRaydiumPool(tx);
-        if (!pool) return;
+          const pool = this._extractRaydiumPool(tx);
+          if (!pool) return;
 
-        logger.info(`[scan] raydium pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
-        await this._emit({
-          chain: 'solana',
-          mint: pool.tokenMint,
-          deployer: pool.deployer,
-          poolAddress: pool.poolAddress,
-          dex: 'raydium',
-          liquidityNative: pool.liquiditySol,
-        });
-      } catch (err) {
-        logger.error(`[scan] raydium parse: ${err.message}`);
-      }
+          logger.info(`[scan] raydium pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
+          await this._emit({
+            chain: 'solana',
+            mint: pool.tokenMint,
+            deployer: pool.deployer,
+            poolAddress: pool.poolAddress,
+            dex: 'raydium',
+            liquidityNative: pool.liquiditySol,
+          });
+        } catch (err) {
+          logger.error(`[scan] raydium parse: ${err.message}`);
+        }
+      });
     }, 'confirmed');
     this.subscriptions.push(() => this.connection.removeOnLogsListener(raydiumId));
     logger.info('[scan] listening for Raydium V4 pools');
