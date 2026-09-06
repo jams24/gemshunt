@@ -47,6 +47,9 @@ class Analyzer {
     // For chains without DexScreener (e.g. Robinhood), build a synthetic
     // market object from on-chain data so the alert isn't all dashes.
     let effectiveMarket = market;
+    if (!market) {
+      logger.info(`[analyze] ${chain}/${mint} no DexScreener — quotedPrice=${quotedPrice}, tokenInfo=${!!tokenInfo}, poolKey=${!!key}, depth=${depth}, nativeUsd=${nativePriceUsd}`);
+    }
     if (!market && (quotedPrice || tokenInfo)) {
       const supply = safety.totalSupply ?? tokenInfo?.totalSupply;
       const mc = quotedPrice && supply ? quotedPrice * supply : null;
