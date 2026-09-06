@@ -13,6 +13,8 @@ const JUPITER_HEADERS = process.env.JUPITER_API_KEY
   ? { 'x-api-key': process.env.JUPITER_API_KEY }
   : {};
 
+const JITO_RPC = 'https://mainnet.block-engine.jito.wtf/api/v1/transactions';
+
 /**
  * Solana swap adapter (Jupiter v6). Amounts crossing this boundary are always
  * RAW integer units — the router owns decimal conversion, not the caller.
@@ -58,7 +60,16 @@ class SolanaSwapAdapter {
     const tx = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
     tx.sign([signer]);
 
-    const sig = await this.connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
+    // Try Jito bundle first (MEV-protected private mempool), fall back to RPC
+    let sig;
+    try {
+      sig = await this._sendViaJito(tx);
+      logger.info(`[sol] jito bundle landed ${sig}`);
+    } catch (jitoErr) {
+      logger.warn(`[sol] jito failed (${jitoErr.message}), falling back to RPC`);
+      sig = await this.connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
+    }
+
     const conf = await this.connection.confirmTransaction(sig, 'confirmed');
     if (conf.value?.err) throw new Error(`Swap reverted on-chain: ${JSON.stringify(conf.value.err)}`);
 
@@ -69,6 +80,18 @@ class SolanaSwapAdapter {
       outputAmount: quote.outAmount,
       priceImpactPct: quote.priceImpactPct,
     };
+  }
+
+  async _sendViaJito(signedTx) {
+    const raw = Buffer.from(signedTx.serialize()).toString('base64');
+    const { data } = await axios.post(JITO_RPC, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'sendTransaction',
+      params: [raw, { encoding: 'base64' }],
+    }, { timeout: 10000 });
+    if (data.error) throw new Error(data.error.message || 'Jito rejected');
+    return data.result;
   }
 
   /** nativeAmount in SOL; returns outputAmount in RAW token units. */
