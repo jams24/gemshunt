@@ -112,6 +112,9 @@ class Tracker {
     if (!outcome) {
       if (liquidityGone || drawdownFromPeak >= RUG_DRAWDOWN) outcome = 'rug';
       else if (peakMultiple >= 2) outcome = 'runner';
+    } else if (outcome === 'runner' && (liquidityGone || drawdownFromPeak >= RUG_DRAWDOWN)) {
+      // Runner that subsequently rugged — reclassify
+      outcome = 'rug';
     }
 
     await this.db.updateTokenOutcome(token.chain, token.mint, {
@@ -120,8 +123,8 @@ class Tracker {
       ...(outcome ? { outcome } : {}),
     });
 
-    // Credit or blame the deployer exactly once, when the verdict first lands.
-    if (outcome && !stored?.outcome && stored?.deployer) {
+    const outcomeChanged = outcome && outcome !== stored?.outcome;
+    if (outcomeChanged && stored?.deployer) {
       await this.db.recordDeployerOutcome(token.chain, stored.deployer, outcome, peakMultiple);
       logger.info(`[track] ${token.chain}/${stored.symbol} → ${outcome} (peak ${peakMultiple.toFixed(2)}x)`);
     }
