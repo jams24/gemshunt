@@ -44,9 +44,10 @@ function scoreEmoji(score) {
  * Renders a scored token as a readable investment thesis rather than a data
  * dump: verdict first, then the case for and against, then the numbers.
  */
-function renderAlert(token, analysis) {
+function renderAlert(token, analysis, deployerStats) {
   const meta = CHAINS[token.chain] || CHAINS.solana;
   const { score, verdict, bulls, bears, categories, confidence } = analysis;
+  const m = token.market || {};
 
   const lines = [];
   lines.push(`${scoreEmoji(score)} <b>${esc(token.symbol || 'UNKNOWN')}</b> — ${esc(verdict)}`);
@@ -54,39 +55,60 @@ function renderAlert(token, analysis) {
   if (confidence < 0.7) {
     lines.push(`<i>⚠️ Partial data — scored on ${Math.round(confidence * 100)}% of signals</i>`);
   }
+  if (token.name && token.name !== token.symbol) lines.push(`<i>${esc(token.name)}</i>`);
   lines.push('');
 
-  if (token.name && token.name !== token.symbol) lines.push(`<i>${esc(token.name)}</i>`);
+  const mc = m.marketCap || token.marketCap;
+  const liq = m.liquidityUsd
+    ? money(m.liquidityUsd)
+    : token.liquiditySol != null ? `${token.liquiditySol.toFixed(2)} ${meta.currency}` : '—';
+  lines.push(`💰 Price: ${price(token.priceUsd)}  ·  MC: ${money(mc)}  ·  Liq: ${liq}`);
+
+  const holderParts = [];
+  if (token.holderCount) holderParts.push(`Holders: ${compact(token.holderCount)}`);
+  if (token.devHoldingPct != null) holderParts.push(`Dev: ${token.devHoldingPct.toFixed(1)}%`);
+  if (token.topHolderPct != null) holderParts.push(`Top: ${token.topHolderPct.toFixed(1)}%`);
+  if (holderParts.length) lines.push(`👥 ${holderParts.join('  ·  ')}`);
+
+  const safety = [];
+  if (token.mintAuthorityRevoked) safety.push('Mint revoked');
+  if (token.freezeAuthorityRevoked) safety.push('Freeze revoked');
+  if (token.lpBurnedPct > 0) safety.push(`LP burned ${token.lpBurnedPct.toFixed(0)}%`);
+  else if (token.lpLocked) safety.push('LP locked');
+  if (token.honeypot === true) safety.push('⚠️ HONEYPOT');
+  if (safety.length) lines.push(`🔒 ${safety.join('  ·  ')}`);
+
+  const vol = [];
+  if (m.volume5m) vol.push(`Vol5m: ${money(m.volume5m)}`);
+  if (m.buys5m != null && m.sells5m != null) vol.push(`Buys: ${m.buys5m}  ·  Sells: ${m.sells5m}`);
+  else if (m.priceChange1h != null && m.priceChange1h !== 0) {
+    vol.push(`1h: ${m.priceChange1h > 0 ? '+' : ''}${m.priceChange1h.toFixed(1)}%`);
+  }
+  if (vol.length) lines.push(`📊 ${vol.join('  ·  ')}`);
+
+  lines.push('');
 
   if (bulls.length) {
     lines.push('<b>Bull case</b>');
-    for (const b of bulls.slice(0, 5)) lines.push(`  ✓ ${esc(b)}`);
+    for (const b of bulls.slice(0, 4)) lines.push(`  ✓ ${esc(b)}`);
   }
   if (bears.length) {
     lines.push('<b>Risks</b>');
-    for (const b of bears.slice(0, 5)) lines.push(`  ✗ ${esc(b)}`);
+    for (const b of bears.slice(0, 4)) lines.push(`  ✗ ${esc(b)}`);
   }
-  lines.push('');
 
-  const m = token.market || {};
-  const stats = [];
-  if (token.priceUsd) stats.push(`Price ${price(token.priceUsd)}`);
-  if (m.marketCap) stats.push(`MC ${money(m.marketCap)}`);
-  else if (token.marketCap) stats.push(`MC ${money(token.marketCap)}`);
-  if (m.liquidityUsd) stats.push(`Liq ${money(m.liquidityUsd)}`);
-  else if (token.liquiditySol) stats.push(`Liq ${token.liquiditySol.toFixed(2)} ${meta.currency}`);
-  if (m.volume5m) stats.push(`Vol5m ${money(m.volume5m)}`);
-  if (token.holderCount) stats.push(`${token.holderCount} holders`);
-  if (m.priceChange1h != null && m.priceChange1h !== 0) {
-    stats.push(`1h ${m.priceChange1h > 0 ? '+' : ''}${m.priceChange1h.toFixed(1)}%`);
+  if (token.deployer) {
+    const addr = token.deployer;
+    const short = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+    let depLine = `🏷 Deployer: <code>${short}</code>`;
+    if (deployerStats) {
+      depLine += ` (${deployerStats.launches} launches, ${deployerStats.rugs || 0} rugs`;
+      if (deployerStats.best_multiple > 1) depLine += `, best ${deployerStats.best_multiple.toFixed(0)}x`;
+      depLine += ')';
+    }
+    lines.push('');
+    lines.push(depLine);
   }
-  if (token.totalSupply) stats.push(`Supply ${compact(token.totalSupply)}`);
-  if (stats.length) lines.push(stats.join('  ·  '));
-
-  const breakdown = Object.entries(categories || {})
-    .map(([k, v]) => `${k.slice(0, 4)} ${v}`)
-    .join(' · ');
-  if (breakdown) lines.push(`<code>${breakdown}</code>`);
 
   lines.push('');
   lines.push(`<code>${esc(token.mint)}</code>`);

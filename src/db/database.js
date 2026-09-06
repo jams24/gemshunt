@@ -603,6 +603,51 @@ async function getScoreBandPerformance() {
   return rows;
 }
 
+async function getLeaderboard(days, limit = 20) {
+  const where = days
+    ? `AND detected_at > NOW() - ('${parseInt(days, 10)} days')::interval`
+    : '';
+  const { rows } = await pool.query(
+    `SELECT chain, mint, symbol, score, initial_mc, peak_price_usd, peak_multiple, outcome, detected_at
+     FROM tokens
+     WHERE peak_multiple IS NOT NULL AND peak_multiple > 1
+       ${where}
+     ORDER BY peak_multiple DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows;
+}
+
+async function getPatternAnalysis(minMultiple = 5, days = 30) {
+  const { rows } = await pool.query(
+    `SELECT
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE peak_multiple >= $1)::int AS winners,
+       ROUND(AVG(score)::numeric, 1) AS avg_score,
+       ROUND(AVG(score) FILTER (WHERE peak_multiple >= $1)::numeric, 1) AS avg_score_winners,
+       ROUND(AVG(initial_mc)::numeric, 0) AS avg_mc,
+       ROUND(AVG(initial_mc) FILTER (WHERE peak_multiple >= $1)::numeric, 0) AS avg_mc_winners,
+       ROUND(AVG(liquidity_sol)::numeric, 2) AS avg_liq,
+       ROUND(AVG(liquidity_sol) FILTER (WHERE peak_multiple >= $1)::numeric, 2) AS avg_liq_winners,
+       ROUND(AVG(holder_count)::numeric, 0) AS avg_holders,
+       ROUND(AVG(holder_count) FILTER (WHERE peak_multiple >= $1)::numeric, 0) AS avg_holders_winners,
+       ROUND(AVG(dev_holding_pct)::numeric, 1) AS avg_dev_pct,
+       ROUND(AVG(dev_holding_pct) FILTER (WHERE peak_multiple >= $1)::numeric, 1) AS avg_dev_pct_winners,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mint_authority_revoked AND peak_multiple >= $1) /
+         NULLIF(COUNT(*) FILTER (WHERE peak_multiple >= $1), 0)::numeric, 0) AS pct_mint_revoked_winners,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE lp_burned_pct > 80 AND peak_multiple >= $1) /
+         NULLIF(COUNT(*) FILTER (WHERE peak_multiple >= $1), 0)::numeric, 0) AS pct_lp_burned_winners,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mint_authority_revoked) /
+         NULLIF(COUNT(*), 0)::numeric, 0) AS pct_mint_revoked_all
+     FROM tokens
+     WHERE score IS NOT NULL
+       AND detected_at > NOW() - ($2 || ' days')::interval`,
+    [minMultiple, days]
+  );
+  return rows[0];
+}
+
 module.exports = {
   init, query, pool,
   getOrCreateUser, getUser, updateUser, getAlertSubscribers,
@@ -614,4 +659,5 @@ module.exports = {
   addWatchedWallet, removeWatchedWallet, getWatchedWallets,
   recordWalletActivity, countWatchersBought, getWalletsBought,
   wasAlerted, recordAlert, getScoreBandPerformance,
+  getLeaderboard, getPatternAnalysis,
 };

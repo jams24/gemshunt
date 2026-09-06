@@ -232,7 +232,9 @@ class TelegramBot {
         `/scan <code>address</code> — Analyze a token\n` +
         `/watch <code>wallet</code> — Track smart money\n` +
         `/watchlist — Tracked wallets\n` +
-        `/analytics — Thesis engine hit rate\n\n` +
+        `/analytics — Thesis engine hit rate\n` +
+        `/leaderboard — Top performing tokens\n` +
+        `/patterns — Winning token patterns\n\n` +
         `<b>Settings:</b>\n` +
         `/chain — Switch chain\n` +
         `/setbuy — Buy amount | /setslippage\n` +
@@ -536,12 +538,16 @@ class TelegramBot {
       ctx.replyWithHTML(`<b>🧠 Tracked wallets (${wallets.length})</b>\n\n${lines.join('\n')}`);
     });
 
-    // === ANALYTICS ===
-    this.bot.command('analytics', async (ctx) => {
+    // === ANALYTICS — shared nav row across all three views ===
+    const _navRow = (active) => [
+      { text: active === 'analytics' ? '• 📈 Hit Rate' : '📈 Hit Rate', callback_data: 'nav_analytics' },
+      { text: active === 'leaderboard' ? '• 🏆 Leaders' : '🏆 Leaders', callback_data: 'nav_leaderboard' },
+      { text: active === 'patterns' ? '• 📊 Patterns' : '📊 Patterns', callback_data: 'nav_patterns' },
+    ];
+
+    const _renderAnalytics = async () => {
       const bands = await db.getScoreBandPerformance();
-      if (!bands.length) {
-        return ctx.reply('Not enough tracked tokens yet — analytics appear once alerted tokens have run their 24h tracking window.');
-      }
+      if (!bands.length) return null;
       const lines = ['<b>📈 Thesis engine performance</b>', '<i>Peak multiple reached after alert</i>', ''];
       for (const b of bands) {
         const rate2x = b.total ? ((b.hit_2x / b.total) * 100).toFixed(0) : '0';
@@ -553,7 +559,140 @@ class TelegramBot {
         );
       }
       lines.push('', '<i>If the high bands don\'t beat the low ones, the scoring weights need tuning.</i>');
-      ctx.replyWithHTML(lines.join('\n'));
+      return lines.join('\n');
+    };
+
+    const _renderLeaderboard = async (days = 7) => {
+      const { scoreEmoji: se, money: m } = require('../analysis/thesis');
+      const tokens = await db.getLeaderboard(days, 15);
+      if (!tokens.length) return null;
+      const label = days >= 9999 ? 'All Time' : `${days}d`;
+      const lines = [`🏆 <b>TOP PERFORMERS — Last ${label}</b>`, ''];
+      tokens.forEach((t, i) => {
+        const chain = CHAINS[t.chain] || CHAINS.solana;
+        const mc = t.initial_mc ? m(t.initial_mc) : '—';
+        const peakMc = t.peak_price_usd && t.initial_mc && t.peak_multiple
+          ? m(t.initial_mc * t.peak_multiple) : '—';
+        lines.push(
+          `${i + 1}. ${se(t.score || 0)} <b>${t.symbol || 'UNKNOWN'}</b> [${Math.round(t.peak_multiple)}x] — Score ${t.score || '?'}\n` +
+          `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}`
+        );
+      });
+      return { text: lines.join('\n'), days };
+    };
+
+    const _renderPatterns = async () => {
+      const { money: m } = require('../analysis/thesis');
+      const p = await db.getPatternAnalysis(5, 30);
+      if (!p || !p.total) return null;
+      const winRate = p.total > 0 ? ((p.winners / p.total) * 100).toFixed(1) : '0';
+      const lines = [
+        `📊 <b>WINNING TOKEN PATTERNS</b> (5x+ runners, last 30d)`,
+        '',
+        `Winners: <b>${p.winners}</b> / ${p.total} tokens (${winRate}%)`,
+        '',
+        `Avg Score: <b>${p.avg_score_winners || '—'}</b> (vs ${p.avg_score || '—'} overall)`,
+        `Avg MC at detection: <b>${m(p.avg_mc_winners)}</b> (vs ${m(p.avg_mc)})`,
+        `Avg Liquidity: <b>${p.avg_liq_winners ? p.avg_liq_winners + ' SOL' : '—'}</b> (vs ${p.avg_liq ? p.avg_liq + ' SOL' : '—'})`,
+        `Avg Dev Hold: <b>${p.avg_dev_pct_winners != null ? p.avg_dev_pct_winners + '%' : '—'}</b> (vs ${p.avg_dev_pct != null ? p.avg_dev_pct + '%' : '—'})`,
+        `Avg Holders at detect: <b>${p.avg_holders_winners || '—'}</b> (vs ${p.avg_holders || '—'})`,
+        '',
+      ];
+      if (p.pct_mint_revoked_winners != null) lines.push(`✅ ${p.pct_mint_revoked_winners}% had mint revoked`);
+      if (p.pct_lp_burned_winners != null) lines.push(`✅ ${p.pct_lp_burned_winners}% had LP burned >80%`);
+      lines.push('', '<i>Compare winner averages vs overall to spot edge signals.</i>');
+      return lines.join('\n');
+    };
+
+    const _lbTimeRow = (days) => [
+      { text: days === 1 ? '• 24h' : '24h', callback_data: 'lb_1' },
+      { text: days === 7 ? '• 7d' : '7d', callback_data: 'lb_7' },
+      { text: days === 30 ? '• 30d' : '30d', callback_data: 'lb_30' },
+      { text: days >= 9999 ? '• All' : 'All', callback_data: 'lb_9999' },
+    ];
+
+    this.bot.command('analytics', async (ctx) => {
+      const html = await _renderAnalytics();
+      if (!html) return ctx.reply('Not enough tracked tokens yet.');
+      ctx.replyWithHTML(html, { reply_markup: { inline_keyboard: [_navRow('analytics')] } });
+    });
+
+    this.bot.command('leaderboard', async (ctx) => {
+      const arg = (ctx.message.text.split(' ')[1] || '7').replace(/[^0-9]/g, '');
+      const days = parseInt(arg, 10) || 7;
+      const result = await _renderLeaderboard(days);
+      if (!result) return ctx.reply('No tracked tokens with peak data yet.');
+      ctx.replyWithHTML(result.text, {
+        reply_markup: { inline_keyboard: [_lbTimeRow(result.days), _navRow('leaderboard')] },
+      });
+    });
+
+    this.bot.action(/lb_(\d+)/, async (ctx) => {
+      const days = parseInt(ctx.match[1], 10);
+      const result = await _renderLeaderboard(days);
+      if (!result) return ctx.answerCbQuery('No data');
+      ctx.answerCbQuery();
+      ctx.editMessageText(result.text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [_lbTimeRow(result.days), _navRow('leaderboard')] },
+      });
+    });
+
+    this.bot.command('patterns', async (ctx) => {
+      const html = await _renderPatterns();
+      if (!html) return ctx.reply('Not enough data yet.');
+      ctx.replyWithHTML(html, { reply_markup: { inline_keyboard: [_navRow('patterns')] } });
+    });
+
+    this.bot.action('nav_analytics', async (ctx) => {
+      const html = await _renderAnalytics();
+      if (!html) return ctx.answerCbQuery('No data yet');
+      ctx.answerCbQuery();
+      ctx.editMessageText(html, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [_navRow('analytics')] },
+      });
+    });
+
+    this.bot.action('nav_leaderboard', async (ctx) => {
+      const result = await _renderLeaderboard(7);
+      if (!result) return ctx.answerCbQuery('No data yet');
+      ctx.answerCbQuery();
+      ctx.editMessageText(result.text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [_lbTimeRow(7), _navRow('leaderboard')] },
+      });
+    });
+
+    this.bot.action('nav_patterns', async (ctx) => {
+      const html = await _renderPatterns();
+      if (!html) return ctx.answerCbQuery('No data yet');
+      ctx.answerCbQuery();
+      ctx.editMessageText(html, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [_navRow('patterns')] },
+      });
+    });
+
+    this.bot.command('scanchain', async (ctx) => {
+      if (String(ctx.from.id) !== String(this.adminId)) return;
+      const args = ctx.message.text.split(/\s+/).slice(1);
+      if (!args.length) {
+        const solOn = process.env.SOLANA_SCANNER_ENABLED !== 'false';
+        const rhOn = process.env.ROBINHOOD_SCANNER_ENABLED !== 'false';
+        return ctx.replyWithHTML(
+          `<b>🔗 Scanner Status</b>\n\n` +
+          `◎ Solana: ${solOn ? '✅ Active' : '❌ Disabled'}\n` +
+          `🪶 Robinhood: ${rhOn ? '✅ Active' : '❌ Disabled'}`
+        );
+      }
+      const [chain, state] = args;
+      if (!['solana', 'robinhood'].includes(chain) || !['on', 'off'].includes(state)) {
+        return ctx.reply('Usage: /scanchain <solana|robinhood> <on|off>');
+      }
+      const envKey = chain === 'solana' ? 'SOLANA_SCANNER_ENABLED' : 'ROBINHOOD_SCANNER_ENABLED';
+      process.env[envKey] = state === 'on' ? 'true' : 'false';
+      ctx.reply(`${chain} scanner ${state === 'on' ? 'enabled' : 'disabled'} (resets on restart)`);
     });
 
     // Catch-all for free text. Must stay registered AFTER every command:

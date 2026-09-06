@@ -55,7 +55,10 @@ class Alerter {
     const subscribers = await this.db.getAlertSubscribers(token.chain, analysis.score, liquidity);
     if (!subscribers.length) return 0;
 
-    const text = renderAlert(token, analysis);
+    const deployerStats = token.deployer
+      ? await this.db.getDeployerStats(token.chain, token.deployer).catch(() => null)
+      : null;
+    const text = renderAlert(token, analysis, deployerStats);
     const keyboard = alertKeyboard(token);
 
     let sent = 0;
