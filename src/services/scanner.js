@@ -2,6 +2,8 @@ const { PublicKey } = require('@solana/web3.js');
 const logger = require('../utils/logger');
 
 const RAYDIUM_AMM_V4 = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
+const PUMPSWAP_AMM = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
+const PUMP_FUN = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const WSOL = 'So11111111111111111111111111111111111111112';
 const SEEN_MAX = 5000;
 
@@ -43,10 +45,14 @@ class Scanner {
   // ------------------------------------------------------------- Solana
 
   async _startSolana() {
-    const subId = this.connection.onLogs(RAYDIUM_AMM_V4, async (logs) => {
+    // PumpSwap — where 95%+ of new tokens launch (Pump.fun graduates here since March 2025)
+    // Pool creations have Initialize + CreateIdempotent logs and 10+ inner instructions
+    const pumpSwapId = this.connection.onLogs(PUMPSWAP_AMM, async (logs) => {
       if (logs.err) return;
-      if (!logs.logs.some(l => l.includes('initialize2'))) return;
-      if (!this._markSeen(`sol:${logs.signature}`)) return;
+      // Pool creations have multiple CreateIdempotent + Initialize logs; swaps don't
+      const createCount = logs.logs.filter(l => l.includes('CreateIdempotent') || l.includes('Initialize the associated')).length;
+      if (createCount < 2) return;
+      if (!this._markSeen(`sol:ps:${logs.signature}`)) return;
 
       try {
         const tx = await this.connection.getParsedTransaction(logs.signature, {
@@ -55,10 +61,42 @@ class Scanner {
         });
         if (!tx) return;
 
-        const pool = this._extractSolanaPool(tx);
+        const pool = this._extractPumpSwapPool(tx);
         if (!pool) return;
 
-        logger.info(`[scan] solana pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
+        logger.info(`[scan] pumpswap pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
+        await this._emit({
+          chain: 'solana',
+          mint: pool.tokenMint,
+          deployer: pool.deployer,
+          poolAddress: pool.poolAddress,
+          dex: 'pumpswap',
+          liquidityNative: pool.liquiditySol,
+        });
+      } catch (err) {
+        logger.error(`[scan] pumpswap parse: ${err.message}`);
+      }
+    }, 'confirmed');
+    this.subscriptions.push(() => this.connection.removeOnLogsListener(pumpSwapId));
+    logger.info('[scan] listening for PumpSwap pools (pump.fun graduates)');
+
+    // Raydium AMM V4 — legacy, still catches some tokens
+    const raydiumId = this.connection.onLogs(RAYDIUM_AMM_V4, async (logs) => {
+      if (logs.err) return;
+      if (!logs.logs.some(l => l.includes('initialize2'))) return;
+      if (!this._markSeen(`sol:ray:${logs.signature}`)) return;
+
+      try {
+        const tx = await this.connection.getParsedTransaction(logs.signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        });
+        if (!tx) return;
+
+        const pool = this._extractRaydiumPool(tx);
+        if (!pool) return;
+
+        logger.info(`[scan] raydium pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
         await this._emit({
           chain: 'solana',
           mint: pool.tokenMint,
@@ -68,15 +106,63 @@ class Scanner {
           liquidityNative: pool.liquiditySol,
         });
       } catch (err) {
-        logger.error(`[scan] solana parse: ${err.message}`);
+        logger.error(`[scan] raydium parse: ${err.message}`);
       }
     }, 'confirmed');
-
-    this.subscriptions.push(() => this.connection.removeOnLogsListener(subId));
-    logger.info('[scan] listening for Raydium pools');
+    this.subscriptions.push(() => this.connection.removeOnLogsListener(raydiumId));
+    logger.info('[scan] listening for Raydium V4 pools');
   }
 
-  _extractSolanaPool(tx) {
+  _extractPumpSwapPool(tx) {
+    try {
+      const accounts = tx.transaction.message.accountKeys;
+      const deployer = accounts[0]?.pubkey?.toBase58();
+      let tokenMint = null;
+      let poolAddress = null;
+
+      // Find the PumpSwap instruction and its accounts
+      for (const ix of tx.transaction.message.instructions) {
+        if (ix.programId?.toBase58() !== PUMPSWAP_AMM.toBase58()) continue;
+        const ixAccounts = ix.accounts || [];
+        if (ixAccounts.length >= 5) {
+          poolAddress = ixAccounts[0]?.toBase58();
+        }
+        break;
+      }
+
+      // Find token mint from inner instructions (initializeAccount3 with non-WSOL mint)
+      for (const group of tx.meta?.innerInstructions || []) {
+        for (const ix of group.instructions || []) {
+          const parsed = ix.parsed;
+          if (!parsed) continue;
+          if (parsed.type === 'initializeAccount3' || parsed.type === 'initializeAccount') {
+            const mint = parsed.info?.mint;
+            if (mint && mint !== WSOL) { tokenMint = mint; break; }
+          }
+        }
+        if (tokenMint) break;
+      }
+
+      if (!tokenMint || tokenMint === WSOL) return null;
+
+      // Liquidity: sum SOL transferred in (look at token balance changes for WSOL account)
+      // Fall back to the deployer's balance drop
+      const pre = tx.meta?.preBalances || [];
+      const post = tx.meta?.postBalances || [];
+      let liquiditySol = 0;
+      for (let i = 0; i < Math.min(pre.length, 10); i++) {
+        const diff = (pre[i] - post[i]) / 1e9;
+        if (diff > 0.01 && diff < 100000) liquiditySol += diff;
+      }
+
+      return { tokenMint, poolAddress: poolAddress || 'unknown', deployer, liquiditySol: Math.max(liquiditySol, 0) };
+    } catch (err) {
+      logger.error(`[scan] pumpswap extract: ${err.message}`);
+      return null;
+    }
+  }
+
+  _extractRaydiumPool(tx) {
     try {
       const accounts = tx.transaction.message.accountKeys;
       const deployer = accounts[0]?.pubkey?.toBase58();
@@ -100,8 +186,6 @@ class Scanner {
       }
       if (!tokenMint || tokenMint === WSOL) return null;
 
-      // Pool SOL is whatever the deployer's own balance dropped by, net of the
-      // rent and fees the earlier heuristic kept mistaking for liquidity.
       const pre = tx.meta?.preBalances || [];
       const post = tx.meta?.postBalances || [];
       let liquiditySol = 0;
@@ -112,7 +196,7 @@ class Scanner {
 
       return { tokenMint, poolAddress, deployer, liquiditySol };
     } catch (err) {
-      logger.error(`[scan] extract: ${err.message}`);
+      logger.error(`[scan] raydium extract: ${err.message}`);
       return null;
     }
   }
