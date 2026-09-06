@@ -113,6 +113,24 @@ class SafetyChecker {
 
     // getTokenLargestAccounts caps at 20, so this is a floor, not a count.
     out.holderCount = largest.value.length >= 20 ? null : largest.value.length;
+
+    // Fake holder detection: if many of the top holders have near-identical
+    // balances, they're likely sybil wallets created to fake distribution.
+    if (largest.value.length >= 5) {
+      const amounts = largest.value.map(a => Number(a.amount)).filter(a => a > 0);
+      const clusters = new Map();
+      for (const amt of amounts) {
+        // Round to 2 significant figures to group near-identical amounts
+        const bucket = Number(amt.toPrecision(2));
+        clusters.set(bucket, (clusters.get(bucket) || 0) + 1);
+      }
+      const maxCluster = Math.max(...clusters.values());
+      if (maxCluster >= 5 && maxCluster / amounts.length > 0.4) {
+        out.flags.push(`${maxCluster} wallets hold near-identical amounts — likely sybil`);
+        out.sybilWallets = maxCluster;
+      }
+    }
+
     return out;
   }
 

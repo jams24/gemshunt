@@ -65,6 +65,33 @@ class Scorer {
         verdict: 'REJECT — concentrated supply',
       };
     }
+    // Mint authority not revoked = deployer can print infinite tokens
+    if (safety.mintAuthorityRevoked === false) {
+      return {
+        score: 0, confidence: 1,
+        categories: { safety: 0 }, bulls: [],
+        bears: ['Mint authority NOT revoked — supply can be inflated at will'],
+        verdict: 'REJECT — mint not revoked',
+      };
+    }
+    // LP not burned or locked = deployer can pull liquidity anytime
+    if (safety.lpBurnedPct != null && safety.lpBurnedPct < 10 && safety.lpLocked !== true) {
+      return {
+        score: 0, confidence: 1,
+        categories: { liquidity: 0 }, bulls: [],
+        bears: [`LP not burned (${safety.lpBurnedPct.toFixed(0)}%) and not locked — rug pull possible`],
+        verdict: 'REJECT — LP unprotected',
+      };
+    }
+    // Sybil wallets = fake distribution to look legit
+    if (safety.sybilWallets >= 5) {
+      return {
+        score: 0, confidence: 1,
+        categories: { distribution: 0 }, bulls: [],
+        bears: [`${safety.sybilWallets} wallets hold identical amounts — fake holders`],
+        verdict: 'REJECT — sybil distribution',
+      };
+    }
 
     const safetyChecks = [safety.mintAuthorityRevoked, safety.freezeAuthorityRevoked];
     const known = safetyChecks.filter(v => v !== null);
