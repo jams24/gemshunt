@@ -48,6 +48,24 @@ class Scorer {
       };
     }
 
+    // Hard reject: extreme concentration = guaranteed rug
+    if (safety.devHoldingPct != null && safety.devHoldingPct > 20) {
+      return {
+        score: 0, confidence: 1,
+        categories: { distribution: 0 }, bulls: [],
+        bears: [`Dev wallet holds ${safety.devHoldingPct.toFixed(0)}% — rug risk`],
+        verdict: 'REJECT — dev holding too high',
+      };
+    }
+    if (safety.topHolderPct != null && safety.topHolderPct > 90) {
+      return {
+        score: 0, confidence: 1,
+        categories: { distribution: 0 }, bulls: [],
+        bears: [`Top 10 wallets hold ${safety.topHolderPct.toFixed(0)}% — no real distribution`],
+        verdict: 'REJECT — concentrated supply',
+      };
+    }
+
     const safetyChecks = [safety.mintAuthorityRevoked, safety.freezeAuthorityRevoked];
     const known = safetyChecks.filter(v => v !== null);
     if (known.length) {
