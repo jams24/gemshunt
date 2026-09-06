@@ -184,7 +184,10 @@ class TelegramBot {
 
       if (hasWallet) {
         const walletAddr = info.chain === 'solana' ? user.sol_wallet_address : user.evm_wallet_address;
-        const bal = await this.walletManager.getBalance(info.chain, walletAddr);
+        const bal = await Promise.race([
+          this.walletManager.getBalance(info.chain, walletAddr),
+          new Promise(r => setTimeout(() => r(0), 5000)),
+        ]);
 
         return ctx.replyWithHTML(
           `<b>⚡ SolSniper</b>\n\n` +
