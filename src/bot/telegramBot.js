@@ -212,7 +212,7 @@ class TelegramBot {
     this.bot.command('menu', async (ctx) => {
       const user = await db.getUser(ctx.from.id);
       const info = this._chainInfo(user);
-      ctx.replyWithHTML(
+      await ctx.replyWithHTML(
         `<b>📋 SolSniper — ${info.emoji} ${info.name}</b>\n\n` +
         `<b>Trade:</b>\n` +
         `• Paste token address to buy\n` +
@@ -231,10 +231,7 @@ class TelegramBot {
         `/alerts — Alert settings\n` +
         `/scan <code>address</code> — Analyze a token\n` +
         `/watch <code>wallet</code> — Track smart money\n` +
-        `/watchlist — Tracked wallets\n` +
-        `/analytics — Thesis engine hit rate\n` +
-        `/leaderboard — Top performing tokens\n` +
-        `/patterns — Winning token patterns\n\n` +
+        `/watchlist — Tracked wallets\n\n` +
         `<b>Settings:</b>\n` +
         `/chain — Switch chain\n` +
         `/setbuy — Buy amount | /setslippage\n` +
@@ -243,6 +240,22 @@ class TelegramBot {
         `/fees — Fee info`,
         this._mainKeyboard(info.chain)
       );
+      ctx.replyWithHTML('<b>📊 Quick Access</b>', {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '📈 Hit Rate', callback_data: 'nav_analytics' },
+              { text: '🏆 Leaderboard', callback_data: 'nav_leaderboard' },
+              { text: '📊 Patterns', callback_data: 'nav_patterns' },
+            ],
+            [
+              { text: '⚙️ Alerts', callback_data: 'menu_alerts' },
+              { text: '🔗 Chain', callback_data: 'switch_chain' },
+              { text: '📋 Watchlist', callback_data: 'menu_watchlist' },
+            ],
+          ],
+        },
+      });
     });
 
     // === CHAIN ===
@@ -564,7 +577,7 @@ class TelegramBot {
 
     const _renderLeaderboard = async (days = 7) => {
       const { scoreEmoji: se, money: m } = require('../analysis/thesis');
-      const tokens = await db.getLeaderboard(days, 15);
+      const tokens = await db.getLeaderboard(days, 10);
       if (!tokens.length) return null;
       const label = days >= 9999 ? 'All Time' : `${days}d`;
       const lines = [`🏆 <b>TOP PERFORMERS — Last ${label}</b>`, ''];
@@ -575,7 +588,8 @@ class TelegramBot {
           ? m(t.initial_mc * t.peak_multiple) : '—';
         lines.push(
           `${i + 1}. ${se(t.score || 0)} <b>${t.symbol || 'UNKNOWN'}</b> [${Math.round(t.peak_multiple)}x] — Score ${t.score || '?'}\n` +
-          `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}`
+          `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}\n` +
+          `   <code>${t.mint}</code>`
         );
       });
       return { text: lines.join('\n'), days };
@@ -672,6 +686,25 @@ class TelegramBot {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [_navRow('patterns')] },
       });
+    });
+
+    this.bot.action('menu_alerts', async (ctx) => {
+      const user = await db.getUser(ctx.from.id);
+      ctx.answerCbQuery();
+      ctx.reply('⚙️ Alert settings:');
+      ctx.replyWithHTML(this._renderAlertSettings(user), this._alertButtons(user));
+    });
+
+    this.bot.action('menu_watchlist', async (ctx) => {
+      ctx.answerCbQuery();
+      const wallets = await db.getWatchedWallets();
+      if (!wallets.length) return ctx.reply('No watched wallets yet. Use /watch <address> to add one.');
+      const lines = ['<b>👀 Watched Wallets</b>', ''];
+      for (const w of wallets) {
+        const label = w.label || w.address.slice(0, 8) + '…';
+        lines.push(`${CHAINS[w.chain]?.emoji || '◎'} <b>${label}</b>\n  <code>${w.address}</code>`);
+      }
+      ctx.replyWithHTML(lines.join('\n'));
     });
 
     this.bot.command('scanchain', async (ctx) => {
