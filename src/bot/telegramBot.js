@@ -589,9 +589,10 @@ class TelegramBot {
         const mc = t.initial_mc ? m(t.initial_mc) : '—';
         const peakMc = t.peak_price_usd && t.initial_mc && t.peak_multiple
           ? m(t.initial_mc * t.peak_multiple) : '—';
+        const date = t.detected_at ? new Date(t.detected_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
         lines.push(
           `${i + 1}. ${se(t.score || 0)} <b>${t.symbol || 'UNKNOWN'}</b> [${Math.round(t.peak_multiple)}x] — Score ${t.score || '?'}\n` +
-          `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}\n` +
+          `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}${date ? `  ·  ${date}` : ''}\n` +
           `   <code>${t.mint}</code>`
         );
       });
