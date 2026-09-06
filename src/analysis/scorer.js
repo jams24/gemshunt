@@ -77,7 +77,7 @@ class Scorer {
     // Note: LP burn check removed — PumpSwap tokens hold LP in the AMM program,
     // never burning to a dead address, so lp_burned_pct = 0 is normal there.
     // Sybil wallets = fake distribution to look legit
-    if (safety.sybilWallets >= 5) {
+    if (safety.sybilWallets >= 8) {
       return {
         score: 0, confidence: 1,
         categories: { distribution: 0 }, bulls: [],
