@@ -29,17 +29,17 @@ class Analyzer {
       if (key) this.swap.rememberPool(chain, mint, key);
     }
 
+    const race = (p, ms, fallback = null) =>
+      Promise.race([p, new Promise(r => setTimeout(() => r(fallback), ms))]);
+
     const [safety, market, nativePriceUsd, tokenInfo, watcherBuys, depth, quotedPrice] = await Promise.all([
-      this.safety.check(chain, mint, key),
-      this.market.getPairData(chain, mint),
-      this.swap.getNativePriceUsd(chain).catch(() => null),
-      this.swap.getTokenInfo(chain, mint).catch(() => null),
-      this.db.countWatchersBought(chain, mint, 60).catch(() => 0),
-      // No indexer covers Robinhood Chain, so measure pool depth from price
-      // impact instead. Without it these tokens have only one scored category
-      // and never clear the confidence gate.
-      this.swap.getLiquidityEstimate(chain, mint, key).catch(() => null),
-      this.swap.getPrice(chain, mint, key).catch(() => null),
+      race(this.safety.check(chain, mint, key), 8000, {}),
+      race(this.market.getPairData(chain, mint), 8000),
+      race(this.swap.getNativePriceUsd(chain).catch(() => null), 5000),
+      race(this.swap.getTokenInfo(chain, mint).catch(() => null), 8000),
+      race(this.db.countWatchersBought(chain, mint, 60).catch(() => 0), 3000, 0),
+      race(this.swap.getLiquidityEstimate(chain, mint, key).catch(() => null), 8000),
+      race(this.swap.getPrice(chain, mint, key).catch(() => null), 8000),
     ]);
 
     const liquidity = liquidityNative ?? depth;

@@ -129,14 +129,17 @@ class WalletManager {
       robinhood: user.evm_wallet_address,
     };
 
+    const withTimeout = (promise, ms) =>
+      Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
     const results = await Promise.all(this.chains().map(async (chain) => {
       const address = walletsByChain[chain];
       if (!address) return { chain, address: null, meta: CHAINS[chain] };
       try {
         const [native, tokens, nativeUsd] = await Promise.all([
-          this.getBalance(chain, address),
-          this.getTokenBalances(chain, address),
-          priceFn ? priceFn(chain).catch(() => null) : Promise.resolve(null),
+          withTimeout(this.getBalance(chain, address), 5000).catch(() => 0),
+          withTimeout(this.getTokenBalances(chain, address), 5000).catch(() => []),
+          priceFn ? withTimeout(priceFn(chain), 5000).catch(() => null) : Promise.resolve(null),
         ]);
         return {
           chain,
@@ -150,7 +153,7 @@ class WalletManager {
         };
       } catch (err) {
         logger.error(`[${chain}] portfolio failed: ${err.message}`);
-        return { chain, address, meta: CHAINS[chain], error: err.message };
+        return { chain, address, meta: CHAINS[chain], native: 0, error: err.message };
       }
     }));
 
