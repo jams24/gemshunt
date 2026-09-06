@@ -611,6 +611,7 @@ async function getLeaderboard(days, limit = 20) {
     `SELECT chain, mint, symbol, score, initial_mc, peak_price_usd, peak_multiple, outcome, detected_at
      FROM tokens
      WHERE peak_multiple IS NOT NULL AND peak_multiple > 1
+       AND (outcome IS NULL OR outcome != 'rug')
        ${where}
      ORDER BY peak_multiple DESC
      LIMIT $1`,
