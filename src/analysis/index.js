@@ -44,21 +44,44 @@ class Analyzer {
 
     const liquidity = liquidityNative ?? depth;
 
+    // For chains without DexScreener (e.g. Robinhood), build a synthetic
+    // market object from on-chain data so the alert isn't all dashes.
+    let effectiveMarket = market;
+    if (!market && (quotedPrice || tokenInfo)) {
+      const supply = safety.totalSupply ?? tokenInfo?.totalSupply;
+      const mc = quotedPrice && supply ? quotedPrice * supply : null;
+      const liqUsd = liquidity && nativePriceUsd ? liquidity * nativePriceUsd : null;
+      effectiveMarket = {
+        symbol: tokenInfo?.symbol || null,
+        name: tokenInfo?.name || null,
+        priceUsd: quotedPrice,
+        priceNative: quotedPrice && nativePriceUsd ? quotedPrice / nativePriceUsd : null,
+        liquidityUsd: liqUsd || 0,
+        marketCap: mc,
+        volume5m: 0, volume1h: 0,
+        buys5m: 0, sells5m: 0,
+        priceChange5m: 0, priceChange1h: 0,
+        pairCreatedAt: null,
+        socials: null,
+        boosts: 0,
+      };
+    }
+
     const analysis = await this.scorer.score({
-      chain, mint, deployer, safety, market,
+      chain, mint, deployer, safety, market: effectiveMarket,
       liquidityNative: liquidity, nativePriceUsd, watcherBuys,
     });
 
     const token = {
       chain,
       mint,
-      symbol: symbol || market?.symbol || tokenInfo?.symbol || 'UNKNOWN',
-      name: name || market?.name || tokenInfo?.name || null,
+      symbol: symbol || effectiveMarket?.symbol || tokenInfo?.symbol || 'UNKNOWN',
+      name: name || effectiveMarket?.name || tokenInfo?.name || null,
       deployer,
       poolAddress,
       dex,
       liquiditySol: liquidity,
-      initialMc: market?.marketCap ?? null,
+      initialMc: effectiveMarket?.marketCap ?? null,
       decimals: safety.decimals ?? tokenInfo?.decimals ?? null,
       totalSupply: safety.totalSupply ?? tokenInfo?.totalSupply ?? null,
       holderCount: safety.holderCount,
@@ -78,14 +101,11 @@ class Analyzer {
         bears: analysis.bears,
       },
       thesis: analysis.verdict,
-      socials: market?.socials || null,
+      socials: effectiveMarket?.socials || null,
       poolKey: key || null,
-      priceUsd: market?.priceUsd ?? quotedPrice ?? null,
-      marketCap: market?.marketCap
-        ?? ((market?.priceUsd ?? quotedPrice) && (safety.totalSupply ?? tokenInfo?.totalSupply)
-            ? (market?.priceUsd ?? quotedPrice) * (safety.totalSupply ?? tokenInfo?.totalSupply)
-            : null),
-      market,
+      priceUsd: effectiveMarket?.priceUsd ?? quotedPrice ?? null,
+      marketCap: effectiveMarket?.marketCap ?? null,
+      market: effectiveMarket,
       watcherBuys,
     };
 
