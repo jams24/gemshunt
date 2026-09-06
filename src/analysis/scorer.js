@@ -74,15 +74,8 @@ class Scorer {
         verdict: 'REJECT — mint not revoked',
       };
     }
-    // LP not burned or locked = deployer can pull liquidity anytime
-    if (safety.lpBurnedPct != null && safety.lpBurnedPct < 10 && safety.lpLocked !== true) {
-      return {
-        score: 0, confidence: 1,
-        categories: { liquidity: 0 }, bulls: [],
-        bears: [`LP not burned (${safety.lpBurnedPct.toFixed(0)}%) and not locked — rug pull possible`],
-        verdict: 'REJECT — LP unprotected',
-      };
-    }
+    // Note: LP burn check removed — PumpSwap tokens hold LP in the AMM program,
+    // never burning to a dead address, so lp_burned_pct = 0 is normal there.
     // Sybil wallets = fake distribution to look legit
     if (safety.sybilWallets >= 5) {
       return {

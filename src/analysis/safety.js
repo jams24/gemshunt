@@ -9,6 +9,14 @@ const BURN_ADDRESSES = new Set([
   '0x000000000000000000000000000000000000dead',
 ]);
 
+// AMM/program token accounts that hold unsold supply — not real "dev" wallets.
+const AMM_ADDRESSES = new Set([
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',  // PumpSwap AMM
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',  // Pump.fun bonding curve
+  'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjQ7F2ag1GVN', // PumpSwap fee vault
+  '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg', // Pump.fun fee account
+]);
+
 /**
  * Chain-agnostic contract safety checks. Returns the same shape for every
  * chain so the scorer never has to know which one it's looking at. Fields it
@@ -97,9 +105,19 @@ class SafetyChecker {
         pct: (Number(a.amount) / total) * 100,
       }));
 
-      // Burn/LP addresses are not real concentration — exclude them or every
-      // healthy token with a burned LP looks like a rug.
-      const real = holders.filter(h => !BURN_ADDRESSES.has(h.address));
+      // Resolve owners of the top 5 token accounts to exclude AMM/program-held supply.
+      const top5 = holders.slice(0, 5);
+      const ownerInfos = await Promise.all(
+        top5.map(h => this.connection.getParsedAccountInfo(new PublicKey(h.address)).catch(() => null))
+      );
+      const excludedAddrs = new Set([...BURN_ADDRESSES]);
+      for (let i = 0; i < top5.length; i++) {
+        const owner = ownerInfos[i]?.value?.data?.parsed?.info?.owner;
+        if (owner && AMM_ADDRESSES.has(owner)) excludedAddrs.add(top5[i].address);
+        if (BURN_ADDRESSES.has(top5[i].address)) excludedAddrs.add(top5[i].address);
+      }
+
+      const real = holders.filter(h => !excludedAddrs.has(h.address));
       out.topHolderPct = real.slice(0, 10).reduce((s, h) => s + h.pct, 0);
       out.devHoldingPct = real[0]?.pct ?? null;
 
