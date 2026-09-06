@@ -6,8 +6,8 @@ const PUMPSWAP_AMM = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'
 const PUMP_FUN = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const WSOL = 'So11111111111111111111111111111111111111112';
 const SEEN_MAX = 5000;
-const MAX_CONCURRENT = 3;
-const QUEUE_MAX = 50;
+const QUEUE_MAX = 30;
+const JOB_COOLDOWN_MS = 2000;
 
 class Scanner {
   constructor({ connection, swapRouter, db }) {
@@ -18,7 +18,7 @@ class Scanner {
     this.seen = new Set();
     this.subscriptions = [];
     this._queue = [];
-    this._active = 0;
+    this._draining = false;
   }
 
   _enqueue(fn) {
@@ -26,15 +26,19 @@ class Scanner {
       this._queue.shift();
     }
     this._queue.push(fn);
-    this._drain();
+    if (!this._draining) this._drain();
   }
 
   async _drain() {
-    while (this._active < MAX_CONCURRENT && this._queue.length) {
-      this._active++;
+    this._draining = true;
+    while (this._queue.length) {
       const job = this._queue.shift();
-      job().finally(() => { this._active--; this._drain(); });
+      try { await job(); } catch {}
+      if (this._queue.length) {
+        await new Promise(r => setTimeout(r, JOB_COOLDOWN_MS));
+      }
     }
+    this._draining = false;
   }
 
   _markSeen(key) {

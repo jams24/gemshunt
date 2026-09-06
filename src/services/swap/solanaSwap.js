@@ -100,14 +100,34 @@ class SolanaSwapAdapter {
   async getTokenInfo(mint) {
     try {
       const mintPk = new PublicKey(mint);
-      const [supply, info] = await Promise.all([
+      const METADATA_PROGRAM = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
+      const [metaPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('metadata'), METADATA_PROGRAM.toBuffer(), mintPk.toBuffer()],
+        METADATA_PROGRAM,
+      );
+      const [supply, info, metaAccount] = await Promise.all([
         this.connection.getTokenSupply(mintPk),
         this.connection.getParsedAccountInfo(mintPk),
+        this.connection.getAccountInfo(metaPda).catch(() => null),
       ]);
       const parsed = info?.value?.data?.parsed?.info;
+
+      let symbol = null;
+      let name = null;
+      if (metaAccount?.data) {
+        try {
+          const d = metaAccount.data;
+          const nameLen = d.readUInt32LE(65);
+          name = d.slice(69, 69 + nameLen).toString('utf8').replace(/\0/g, '').trim() || null;
+          const symOffset = 69 + nameLen;
+          const symLen = d.readUInt32LE(symOffset);
+          symbol = d.slice(symOffset + 4, symOffset + 4 + symLen).toString('utf8').replace(/\0/g, '').trim() || null;
+        } catch {}
+      }
+
       return {
-        symbol: null,
-        name: null,
+        symbol,
+        name,
         decimals: supply.value.decimals,
         totalSupply: Number(supply.value.uiAmount),
         rawSupply: supply.value.amount,
