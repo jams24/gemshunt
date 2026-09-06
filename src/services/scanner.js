@@ -84,6 +84,7 @@ class Scanner {
 
           const pool = this._extractPumpSwapPool(tx);
           if (!pool) return;
+          if (!this._markSeen(`sol:mint:${pool.tokenMint}`)) return;
 
           logger.info(`[scan] pumpswap pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
           await this._emit({
@@ -118,6 +119,7 @@ class Scanner {
 
           const pool = this._extractRaydiumPool(tx);
           if (!pool) return;
+          if (!this._markSeen(`sol:mint:${pool.tokenMint}`)) return;
 
           logger.info(`[scan] raydium pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
           await this._emit({
@@ -235,6 +237,7 @@ class Scanner {
     try {
       this.swap.adapter('robinhood').onNewPool(async ({ tokenAddress, poolId, poolKey }) => {
         if (!this._markSeen(`rh:${poolId}`)) return;
+        if (!this._markSeen(`rh:mint:${tokenAddress}`)) return;
         logger.info(`[scan] robinhood pool ${tokenAddress} fee=${poolKey.fee} spacing=${poolKey.tickSpacing}`);
         await this._emit({
           chain: 'robinhood',
