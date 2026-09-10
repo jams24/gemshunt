@@ -82,6 +82,22 @@ The alerter additionally refuses to send anything below 50% confidence.
 - **Alchemy's free tier caps `eth_getLogs` to a 10-block range**, so historical
   log scans need paging; live subscriptions are unaffected.
 
+## Silence is a failure mode
+
+Every outage in this project has presented the same way: process healthy, logs
+calm, zero alerts. A moved Jupiter endpoint, a guessed V4 pool key, an
+exhausted RPC quota — all of them looked exactly like a quiet market.
+
+`services/healthMonitor.js` exists for that. It runs a preflight before the bot
+claims to be running (asking for something that actually costs the provider
+money — `getHealth` is served even when credits are gone) and warns the admin
+when a chain has produced no pools for `HEALTH_SILENT_MINUTES`. Quota
+exhaustion is detected by message signature and named explicitly, because it is
+the failure that looks least like a failure.
+
+When adding a dependency, add it to `preflight()`. An unchecked dependency is
+one that will one day fail silently.
+
 ## Sellability is three-valued
 
 `checkSellable` returns `true`, `false`, or **`null` for unknown**, and

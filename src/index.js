@@ -10,6 +10,7 @@ const Analyzer = require('./analysis');
 const Scanner = require('./services/scanner');
 const Alerter = require('./services/alerter');
 const Tracker = require('./services/tracker');
+const HealthMonitor = require('./services/healthMonitor');
 const TradeEngine = require('./engine/tradeEngine');
 const TelegramBot = require('./bot/telegramBot');
 
@@ -36,9 +37,11 @@ async function main() {
     tradeEngine: engine, walletManager, swapRouter, analyzer, tracker, config,
   });
   const alerter = new Alerter({ db, bot, config });
+  const health = new HealthMonitor({ db, swapRouter, connection, config, bot });
 
   // --- new token → analyze → persist → alert → track ---
   scanner.onNewToken = async (raw) => {
+    health.recordPool(raw.chain);
     try {
       const { token, analysis } = await analyzer.analyze(raw);
 
@@ -48,7 +51,8 @@ async function main() {
         token.trackingUntil = tracker.trackingDeadline();
       }
       await db.saveToken(token);
-      await alerter.dispatchNewToken(token, analysis);
+      const sent = await alerter.dispatchNewToken(token, analysis);
+      if (sent) health.recordAlert(raw.chain);
     } catch (err) {
       logger.error(`[pipeline] ${raw.chain}/${raw.mint}: ${err.message}`);
     }
@@ -68,11 +72,27 @@ async function main() {
     engine.checkAllPositions().catch(err => logger.error(`[monitor] ${err.message}`));
   }, config.positionCheckIntervalSec * 1000);
 
+  // --- verify the dependencies actually work before claiming to run ---
+  // Quota exhaustion is the failure mode that hurts most: the endpoint stays
+  // up, answers cheap calls, and refuses the ones detection depends on. The
+  // process looks healthy while seeing nothing.
+  const problems = await health.preflight();
+  if (problems.length) {
+    for (const p of problems) logger.error(`[preflight] ${p}`);
+    if (config.health.failFast) {
+      throw new Error(`Preflight failed:\n${problems.map(p => `  - ${p}`).join('\n')}`);
+    }
+    logger.warn('[preflight] starting anyway — set HEALTH_FAIL_FAST=true to refuse instead');
+  } else {
+    logger.info('[preflight] all RPC endpoints healthy');
+  }
+
   // --- start everything ---
   await bot.launch();
   await scanner.start();
   tracker.start();
   await tracker.startWalletWatching();
+  health.start();
 
   if (config.telegram.adminId) {
     const { rows: [s] } = await db.query('SELECT COUNT(*)::int AS c FROM users');
@@ -82,7 +102,8 @@ async function main() {
       `Chains: ${Object.values(CHAINS).map(c => `${c.emoji} ${c.name}`).join(' + ')}\n` +
       `Users: ${s.c}  ·  Tracked wallets: ${w.c}\n` +
       `Alert threshold: ${config.alerts.minScore}/100  ·  Fee: ${config.trading.platformFeePct}%\n\n` +
-      `Scanning for new pools.`
+      `Scanning for new pools.` +
+      (problems.length ? `\n\n⚠️ <b>Problems detected</b>\n${problems.map(p => `• ${p}`).join('\n')}` : '')
     );
   }
 
@@ -93,6 +114,7 @@ async function main() {
     clearInterval(positionTimer);
     scanner.stop();
     tracker.stop();
+    health.stop();
     bot.stop();
     db.pool.end().finally(() => process.exit(0));
   };

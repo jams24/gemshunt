@@ -83,6 +83,15 @@ const config = {
   },
 
   positionCheckIntervalSec: int('POSITION_CHECK_INTERVAL', 30),
+
+  health: {
+    // Warn the admin when a chain has produced no pools for this long. A quiet
+    // market looks exactly like a dead RPC unless something measures it.
+    silentMinutes: int('HEALTH_SILENT_MINUTES', 45),
+    // Refuse to start when a dependency is already broken, rather than running
+    // deaf and looking healthy.
+    failFast: bool('HEALTH_FAIL_FAST', false),
+  },
 };
 
 module.exports = config;
