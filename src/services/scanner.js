@@ -65,19 +65,27 @@ class Scanner {
   }
 
   _startWatchdog() {
-    const CHECK_MS = 3 * 60 * 1000;
-    const STALE_MS = 10 * 60 * 1000;
+    const CHECK_MS = 5 * 60 * 1000;
+    const STALE_MS = 15 * 60 * 1000;
+    this._reconnectAttempts = 0;
     this._watchdog = setInterval(async () => {
       const last = this._lastSolanaPool || this._startedAt || Date.now();
       const quiet = Date.now() - last;
       if (quiet < STALE_MS) return;
-      logger.warn(`[scan] Solana silent for ${Math.round(quiet / 60000)}m — reconnecting WebSocket`);
+
+      this._reconnectAttempts++;
+      const backoff = Math.min(this._reconnectAttempts * 5, 30);
+      logger.warn(`[scan] Solana silent for ${Math.round(quiet / 60000)}m — reconnecting (attempt ${this._reconnectAttempts}, next check in ${backoff}m)`);
+
       try {
         for (const unsub of this.subscriptions) {
           try { unsub(); } catch {}
         }
         this.subscriptions = [];
+        await new Promise(r => setTimeout(r, backoff * 1000));
         await this._startSolana();
+        this._lastSolanaPool = Date.now();
+        this._reconnectAttempts = 0;
         logger.info('[scan] Solana WebSocket reconnected');
       } catch (err) {
         logger.error(`[scan] reconnect failed: ${err.message}`);
