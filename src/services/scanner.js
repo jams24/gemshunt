@@ -50,6 +50,7 @@ class Scanner {
 
   async _emit(token) {
     try {
+      if (token.chain === 'solana') this._lastSolanaPool = Date.now();
       await this.db.recordDeployerLaunch(token.chain, token.deployer);
       if (this.onNewToken) await this.onNewToken(token);
     } catch (err) {
@@ -60,6 +61,30 @@ class Scanner {
   async start() {
     await this._startSolana();
     this._startRobinhood();
+    this._startWatchdog();
+  }
+
+  _startWatchdog() {
+    const CHECK_MS = 3 * 60 * 1000;
+    const STALE_MS = 10 * 60 * 1000;
+    this._watchdog = setInterval(async () => {
+      const last = this._lastSolanaPool || this._startedAt || Date.now();
+      const quiet = Date.now() - last;
+      if (quiet < STALE_MS) return;
+      logger.warn(`[scan] Solana silent for ${Math.round(quiet / 60000)}m — reconnecting WebSocket`);
+      try {
+        for (const unsub of this.subscriptions) {
+          try { unsub(); } catch {}
+        }
+        this.subscriptions = [];
+        await this._startSolana();
+        logger.info('[scan] Solana WebSocket reconnected');
+      } catch (err) {
+        logger.error(`[scan] reconnect failed: ${err.message}`);
+      }
+    }, CHECK_MS);
+    this._watchdog.unref?.();
+    this._startedAt = Date.now();
   }
 
   // ------------------------------------------------------------- Solana
@@ -256,6 +281,7 @@ class Scanner {
   }
 
   stop() {
+    if (this._watchdog) clearInterval(this._watchdog);
     for (const unsub of this.subscriptions) {
       try { unsub(); } catch { /* already gone */ }
     }

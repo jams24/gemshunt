@@ -65,14 +65,18 @@ class Scorer {
         verdict: 'REJECT — concentrated supply',
       };
     }
-    // Mint authority not revoked = deployer can print infinite tokens
+    // Mint not revoked: hard reject on Solana, score penalty on EVM where
+    // "owner not renounced" is common even on legitimate tokens.
     if (safety.mintAuthorityRevoked === false) {
-      return {
-        score: 0, confidence: 1,
-        categories: { safety: 0 }, bulls: [],
-        bears: ['Mint authority NOT revoked — supply can be inflated at will'],
-        verdict: 'REJECT — mint not revoked',
-      };
+      if (chain === 'solana') {
+        return {
+          score: 0, confidence: 1,
+          categories: { safety: 0 }, bulls: [],
+          bears: ['Mint authority NOT revoked — supply can be inflated at will'],
+          verdict: 'REJECT — mint not revoked',
+        };
+      }
+      bears.push('Owner not renounced — contract is still mutable');
     }
     // Note: LP burn check removed — PumpSwap tokens hold LP in the AMM program,
     // never burning to a dead address, so lp_burned_pct = 0 is normal there.
@@ -90,7 +94,9 @@ class Scorer {
     const known = safetyChecks.filter(v => v !== null);
     if (known.length) {
       let s = known.filter(Boolean).length / known.length;
-      // A heavy round-trip loss is a sell tax even when the swap succeeds.
+      // On EVM, unrenounced ownership is common on legitimate tokens — floor
+      // the safety score at 0.4 so it's a penalty, not a death sentence.
+      if (chain !== 'solana' && s < 0.4) s = 0.4;
       if (safety.sellTaxPct != null && safety.sellTaxPct > 15) {
         s *= inverseScale(safety.sellTaxPct, 15, 60);
         bears.push(`~${safety.sellTaxPct.toFixed(0)}% round-trip loss (likely sell tax)`);

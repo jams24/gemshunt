@@ -36,14 +36,18 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
       ...options,
     });
 
-    this.minIntervalMs = options.minIntervalMs ?? 120;
+    // Concurrency cap, not a delay: batching means many logical calls become
+    // few HTTP requests, so allowing them in parallel is what makes batching
+    // possible at all.
+    this.maxConcurrent = options.maxConcurrent ?? 24;
     this.maxRetries = options.maxRetries ?? 3;
     this.breakerThreshold = options.breakerThreshold ?? 5;
     this.breakerCooldownMs = options.breakerCooldownMs ?? 60_000;
 
     this._chain = 'evm';
-    this._lastRequest = 0;
-    this._queue = Promise.resolve();
+    this._inFlight = 0;
+    this._waiting = [];
+    this._last429At = 0;
     this._consecutive429 = 0;
     this._breakerUntil = 0;
     this._pollingPaused = false;
@@ -68,18 +72,40 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
     return Date.now() < this._breakerUntil;
   }
 
-  /** Serialise every RPC call behind a minimum spacing. */
+  /**
+   * Rate limiting here is about HTTP requests, not logical calls.
+   *
+   * This used to serialise every send behind a minimum interval, which quietly
+   * defeated ethers' request batching: call 2 was never issued until call 1
+   * resolved, so 20 calls became 20 HTTP requests instead of one. Measured on
+   * the public RPC that made a five-call token read 1716ms instead of 493ms,
+   * and pushed the analyzer past its 8s budget so token metadata came back
+   * empty. Letting concurrent sends through lets ethers coalesce them, which
+   * reduces request count rather than increasing it.
+   */
   send(method, params) {
-    const run = async () => {
-      const wait = this.minIntervalMs - (Date.now() - this._lastRequest);
-      if (wait > 0) await sleep(wait);
-      this._lastRequest = Date.now();
-      return this._sendWithBackoff(method, params);
-    };
-    // Chain onto the queue but don't let one rejection poison the next call.
-    const result = this._queue.then(run, run);
-    this._queue = result.catch(() => {});
-    return result;
+    if (this._inFlight < this.maxConcurrent) {
+      this._inFlight++;
+      const p = this._sendWithBackoff(method, params);
+      const release = () => { this._inFlight--; this._drain(); };
+      p.then(release, release);
+      return p;
+    }
+    // At the cap, queue rather than pile on.
+    return new Promise((resolve, reject) => {
+      this._waiting.push({ method, params, resolve, reject });
+    });
+  }
+
+  _drain() {
+    while (this._inFlight < this.maxConcurrent && this._waiting.length) {
+      const job = this._waiting.shift();
+      this._inFlight++;
+      const p = this._sendWithBackoff(job.method, job.params);
+      const release = () => { this._inFlight--; this._drain(); };
+      p.then(release, release);
+      p.then(job.resolve, job.reject);
+    }
   }
 
   async _sendWithBackoff(method, params) {
@@ -121,6 +147,13 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
   }
 
   _on429() {
+    // With batching, a single rate-limited HTTP request rejects every logical
+    // call inside it. Counting each one separately made a batch of five trip a
+    // five-strike breaker on the first failure. Collapse failures that land in
+    // the same instant into one strike.
+    const now = Date.now();
+    if (now - this._last429At < 150) return;
+    this._last429At = now;
     this._consecutive429++;
     if (this._consecutive429 < this.breakerThreshold || this.rateLimited) return;
 
@@ -174,7 +207,7 @@ function getEvmProvider(chainConfig) {
   if (providers.has(key)) return providers.get(key);
 
   const provider = new ThrottledProvider(url, chainConfig.chainId, {
-    minIntervalMs: parseInt(process.env.EVM_MIN_REQUEST_INTERVAL_MS, 10) || 120,
+    maxConcurrent: parseInt(process.env.EVM_MAX_CONCURRENT, 10) || 24,
   });
   // Slow the event poll right down. Pool detection a few seconds later is a
   // fine trade for staying under the limit.
