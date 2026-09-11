@@ -84,6 +84,9 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
    * reduces request count rather than increasing it.
    */
   send(method, params) {
+    if (this.rateLimited) {
+      return Promise.reject(Object.assign(new Error(`RPC breaker active (${method})`), { code: 'RATE_LIMITED' }));
+    }
     if (this._inFlight < this.maxConcurrent) {
       this._inFlight++;
       const p = this._sendWithBackoff(method, params);
@@ -110,7 +113,9 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
 
   async _sendWithBackoff(method, params) {
     if (this.rateLimited) {
-      throw new Error(`RPC rate limited, retrying after cooldown (${method})`);
+      const err = new Error(`RPC rate limited, retrying after cooldown (${method})`);
+      err.code = 'RATE_LIMITED';
+      throw err;
     }
 
     let lastErr;
@@ -158,9 +163,18 @@ class ThrottledProvider extends ethers.JsonRpcProvider {
     if (this._consecutive429 < this.breakerThreshold || this.rateLimited) return;
 
     this._breakerUntil = Date.now() + this.breakerCooldownMs;
+    // Reject all queued requests so they don't pile up as unhandled rejections
+    // when the breaker releases.
+    const queued = this._waiting.splice(0);
+    if (queued.length) {
+      const err = new Error('RPC breaker tripped — request dropped');
+      err.code = 'RATE_LIMITED';
+      for (const job of queued) job.reject(err);
+    }
     logger.error(
       `[evm] RPC rate limited ${this._consecutive429}x — pausing chain activity for ` +
-      `${this.breakerCooldownMs / 1000}s. Set ROBINHOOD_RPC_URL to a private endpoint to avoid this.`
+      `${this.breakerCooldownMs / 1000}s${queued.length ? ` (dropped ${queued.length} queued)` : ''}. ` +
+      `Set ROBINHOOD_RPC_URL to a private endpoint to avoid this.`
     );
     this._pausePolling();
     setTimeout(() => {
@@ -207,7 +221,7 @@ function getEvmProvider(chainConfig) {
   if (providers.has(key)) return providers.get(key);
 
   const provider = new ThrottledProvider(url, chainConfig.chainId, {
-    maxConcurrent: parseInt(process.env.EVM_MAX_CONCURRENT, 10) || 24,
+    maxConcurrent: parseInt(process.env.EVM_MAX_CONCURRENT, 10) || (process.env.ROBINHOOD_RPC_URL ? 12 : 3),
   });
   // Slow the event poll right down. Pool detection a few seconds later is a
   // fine trade for staying under the limit.
