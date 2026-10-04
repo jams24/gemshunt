@@ -10,25 +10,48 @@ const Analyzer = require('./analysis');
 const Scanner = require('./services/scanner');
 const Alerter = require('./services/alerter');
 const Tracker = require('./services/tracker');
+const Pipeline = require('./services/pipeline');
 const HealthMonitor = require('./services/healthMonitor');
 const TradeEngine = require('./engine/tradeEngine');
 const TelegramBot = require('./bot/telegramBot');
+
+// A rejected promise anywhere must not take the bot down mid-position.
+// Registered first so nothing during startup can escape it.
+process.on('unhandledRejection', (err) => {
+  logger.error(`Unhandled rejection: ${err?.stack || err?.message || err}`);
+});
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught exception: ${err?.stack || err?.message || err}`);
+});
+
+const solanaConnection = () => new Connection(config.solana.rpcUrl, {
+  commitment: 'confirmed',
+  wsEndpoint: config.solana.wsUrl,
+  // web3.js retries 429s internally with exponential backoff and no cap on
+  // total time — a call could block for minutes. Callers here bound their
+  // own waits, so fail fast and let them decide.
+  disableRetryOnRateLimit: true,
+});
 
 async function main() {
   logger.info('Starting SolSniper...');
   await db.init();
 
-  const connection = new Connection(config.solana.rpcUrl, {
-    commitment: 'confirmed',
-    wsEndpoint: config.solana.wsUrl,
-  });
+  // Trading, wallets and analysis share one connection. The scanner gets its
+  // own so it can be rebuilt when its websocket dies without disturbing the
+  // tracker's wallet subscriptions or an in-flight trade.
+  const connection = solanaConnection();
 
   // --- core services ---
   const walletManager = new WalletManager(connection, config.encryptionKey);
-  const swapRouter = new SwapRouter(connection);
+  const swapRouter = new SwapRouter(connection, { db });
   const analyzer = new Analyzer({ db, solanaConnection: connection, swapRouter });
   const engine = new TradeEngine({ swapRouter, walletManager, config });
-  const scanner = new Scanner({ connection, swapRouter, db });
+  const scanner = new Scanner({
+    connection: solanaConnection(),
+    connectionFactory: solanaConnection,
+    swapRouter, db, config,
+  });
   const tracker = new Tracker({
     db, swapRouter, marketData: analyzer.market, connection, config,
   });
@@ -37,26 +60,12 @@ async function main() {
     tradeEngine: engine, walletManager, swapRouter, analyzer, tracker, config,
   });
   const alerter = new Alerter({ db, bot, config });
-  const health = new HealthMonitor({ db, swapRouter, connection, config, bot });
+  const health = new HealthMonitor({ db, swapRouter, connection, config, bot, scanner, analyzer });
+  const pipeline = new Pipeline({ analyzer, db, alerter, tracker, health, config });
+  bot.attach({ scanner, health });
 
-  // --- new token → analyze → persist → alert → track ---
-  scanner.onNewToken = async (raw) => {
-    health.recordPool(raw.chain);
-    try {
-      const { token, analysis } = await analyzer.analyze(raw);
-
-      // Track anything worth alerting on, so we learn whether the thesis was
-      // right even when nobody buys it.
-      if (analysis.score >= config.alerts.minScore) {
-        token.trackingUntil = tracker.trackingDeadline();
-      }
-      await db.saveToken(token);
-      const sent = await alerter.dispatchNewToken(token, analysis);
-      if (sent) health.recordAlert(raw.chain);
-    } catch (err) {
-      logger.error(`[pipeline] ${raw.chain}/${raw.mint}: ${err.message}`);
-    }
-  };
+  // --- new token → analyze → persist → alert → re-check → track ---
+  scanner.onNewToken = (raw) => pipeline.onDetected(raw);
 
   tracker.onSmartMoneyBuy = async (token, wallets) => {
     try {
@@ -67,7 +76,7 @@ async function main() {
     }
   };
 
-  // --- position monitor ---
+  // --- position monitor (single-flight inside the engine) ---
   const positionTimer = setInterval(() => {
     engine.checkAllPositions().catch(err => logger.error(`[monitor] ${err.message}`));
   }, config.positionCheckIntervalSec * 1000);
@@ -84,7 +93,7 @@ async function main() {
     }
     logger.warn('[preflight] starting anyway — set HEALTH_FAIL_FAST=true to refuse instead');
   } else {
-    logger.info('[preflight] all RPC endpoints healthy');
+    logger.info('[preflight] all dependencies healthy');
   }
 
   // --- start everything ---
@@ -97,37 +106,39 @@ async function main() {
   if (config.telegram.adminId) {
     const { rows: [s] } = await db.query('SELECT COUNT(*)::int AS c FROM users');
     const { rows: [w] } = await db.query('SELECT COUNT(*)::int AS c FROM wallet_watch WHERE is_active');
+    const enabled = Object.entries(CHAINS).filter(([k]) => scanner.enabled[k]);
     await bot.sendAlert(config.telegram.adminId,
       `🚀 <b>SolSniper online</b>\n\n` +
-      `Chains: ${Object.values(CHAINS).map(c => `${c.emoji} ${c.name}`).join(' + ')}\n` +
+      `Scanning: ${enabled.map(([, c]) => `${c.emoji} ${c.name}`).join(' + ') || 'nothing (all scanners off)'}\n` +
       `Users: ${s.c}  ·  Tracked wallets: ${w.c}\n` +
-      `Alert threshold: ${config.alerts.minScore}/100  ·  Fee: ${config.trading.platformFeePct}%\n\n` +
-      `Scanning for new pools.` +
+      `Default alert score: ${config.alerts.minScore}  ·  Floor: ${config.alerts.floor}  ·  ` +
+      `Re-checks at +${config.recheck.delaysMin.join('/+')}m\n` +
+      `Fee: ${config.trading.platformFeePct}%\n\n` +
+      `/health shows the live pipeline.` +
       (problems.length ? `\n\n⚠️ <b>Problems detected</b>\n${problems.map(p => `• ${p}`).join('\n')}` : '')
     );
   }
 
   logger.info('SolSniper running');
 
+  let shuttingDown = false;
   const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info(`${signal} — shutting down`);
     clearInterval(positionTimer);
+    pipeline.stop();
     scanner.stop();
     tracker.stop();
     health.stop();
     bot.stop();
-    db.pool.end().finally(() => process.exit(0));
+    // Give in-flight DB writes a moment, but never hang the deploy.
+    const force = setTimeout(() => process.exit(0), 5000);
+    force.unref?.();
+    db.pool.end().catch(() => {}).finally(() => process.exit(0));
   };
   process.once('SIGINT', () => shutdown('SIGINT'));
   process.once('SIGTERM', () => shutdown('SIGTERM'));
-
-  // A rejected promise anywhere must not take the bot down mid-position.
-  process.on('unhandledRejection', (err) => {
-    logger.error(`Unhandled rejection: ${err?.stack || err?.message || err}`);
-  });
-  process.on('uncaughtException', (err) => {
-    logger.error(`Uncaught exception: ${err?.stack || err?.message || err}`);
-  });
 }
 
 main().catch((err) => {

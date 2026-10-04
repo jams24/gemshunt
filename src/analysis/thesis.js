@@ -3,8 +3,13 @@ const CHAINS = require('../services/chains');
 const esc = (s) => String(s ?? '')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+// Postgres returns NUMERIC/ROUND() results as strings, so every formatter
+// coerces first — a string here used to throw inside a bot handler.
+const num = (n) => (n == null || n === '' ? NaN : Number(n));
+
 function money(n) {
-  if (n == null) return '—';
+  n = num(n);
+  if (!Number.isFinite(n)) return '—';
   if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
   if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
   if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
@@ -13,14 +18,16 @@ function money(n) {
 
 /** Token prices span many orders of magnitude; keep them readable. */
 function price(n) {
-  if (n == null) return '—';
+  n = num(n);
+  if (!Number.isFinite(n)) return '—';
   if (n >= 1) return `$${n.toFixed(4)}`;
   if (n >= 1e-6) return `$${n.toFixed(9).replace(/0+$/, '')}`;
   return `$${n.toExponential(3)}`;
 }
 
 function compact(n) {
-  if (n == null) return '—';
+  n = num(n);
+  if (!Number.isFinite(n)) return '—';
   if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
@@ -29,7 +36,7 @@ function compact(n) {
 }
 
 function scoreBar(score) {
-  const filled = Math.round(score / 10);
+  const filled = Math.max(0, Math.min(10, Math.round(Number(score) / 10) || 0));
   return '█'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
@@ -44,12 +51,19 @@ function scoreEmoji(score) {
  * Renders a scored token as a readable investment thesis rather than a data
  * dump: verdict first, then the case for and against, then the numbers.
  */
-function renderAlert(token, analysis, deployerStats) {
+const STAGE_HEADER = {
+  launch: () => '🆕 <b>NEW LAUNCH</b>',
+  recheck: (age) => `⏱ <b>NOW QUALIFYING</b> · ${age}m after launch`,
+  momentum: (age) => `📈 <b>MOMENTUM CONFIRMED</b> · ${age}m after launch`,
+};
+
+function renderAlert(token, analysis, deployerStats, { stage, ageMin = 0 } = {}) {
   const meta = CHAINS[token.chain] || CHAINS.solana;
-  const { score, verdict, bulls, bears, categories, confidence } = analysis;
+  const { score, verdict, bulls, bears, confidence } = analysis;
   const m = token.market || {};
 
   const lines = [];
+  if (stage && STAGE_HEADER[stage]) lines.push(STAGE_HEADER[stage](Math.max(1, Math.round(ageMin))));
   lines.push(`${scoreEmoji(score)} <b>${esc(token.symbol || 'UNKNOWN')}</b> — ${esc(verdict)}`);
   lines.push(`${meta.emoji} ${meta.name}  ·  <code>${scoreBar(score)}</code> <b>${score}</b>/100`);
   if (confidence < 0.7) {
@@ -59,9 +73,11 @@ function renderAlert(token, analysis, deployerStats) {
   lines.push('');
 
   const mc = m.marketCap || token.marketCap;
-  const liq = m.liquidityUsd
-    ? money(m.liquidityUsd)
-    : token.liquiditySol != null ? `${token.liquiditySol.toFixed(2)} ${meta.currency}` : '—';
+  const liqUsd = m.liquidityUsd || token.liquidityUsd;
+  let liq = liqUsd ? money(liqUsd) : '—';
+  if (!m.liquidityUsd && token.liquiditySol != null) {
+    liq = `${liq === '—' ? '' : `${liq} · `}${token.liquiditySol.toFixed(2)} ${meta.currency}`;
+  }
   lines.push(`💰 Price: ${price(token.priceUsd)}  ·  MC: ${money(mc)}  ·  Liq: ${liq}`);
 
   const holderParts = [];
@@ -71,16 +87,20 @@ function renderAlert(token, analysis, deployerStats) {
   if (holderParts.length) lines.push(`👥 ${holderParts.join('  ·  ')}`);
 
   const safety = [];
-  if (token.mintAuthorityRevoked) safety.push('Mint revoked');
-  if (token.freezeAuthorityRevoked) safety.push('Freeze revoked');
-  if (token.lpBurnedPct > 0) safety.push(`LP burned ${token.lpBurnedPct.toFixed(0)}%`);
+  const evm = token.chain !== 'solana';
+  if (token.mintAuthorityRevoked) safety.push(evm ? 'Owner renounced' : 'Mint revoked');
+  if (token.freezeAuthorityRevoked && !evm) safety.push('Freeze revoked');
+  if (token.lpBurnedPct > 50) safety.push(`LP burned ${token.lpBurnedPct.toFixed(0)}%`);
   else if (token.lpLocked) safety.push('LP locked');
+  else if (token.lpUnlockedPct >= 50) safety.push('⚠️ LP UNLOCKED');
+  if (token.honeypot === false) safety.push('Sellable');
   if (token.honeypot === true) safety.push('⚠️ HONEYPOT');
+  if (token.sellTaxPct != null && token.sellTaxPct > 10) safety.push(`Round-trip cost ~${token.sellTaxPct.toFixed(0)}%`);
   if (safety.length) lines.push(`🔒 ${safety.join('  ·  ')}`);
 
   const vol = [];
   if (m.volume5m) vol.push(`Vol5m: ${money(m.volume5m)}`);
-  if (m.buys5m != null && m.sells5m != null) vol.push(`Buys: ${m.buys5m}  ·  Sells: ${m.sells5m}`);
+  if (m.buys5m || m.sells5m) vol.push(`5m: ${m.buys5m}B / ${m.sells5m}S`);
   else if (m.priceChange1h != null && m.priceChange1h !== 0) {
     vol.push(`1h: ${m.priceChange1h > 0 ? '+' : ''}${m.priceChange1h.toFixed(1)}%`);
   }
@@ -112,9 +132,13 @@ function renderAlert(token, analysis, deployerStats) {
 
   lines.push('');
   lines.push(`<code>${esc(token.mint)}</code>`);
-  lines.push(`<a href="${meta.tokenUrl(token.mint)}">Explorer</a>`);
+  lines.push(`<a href="${meta.tokenUrl(token.mint)}">Explorer</a>  ·  <a href="${chartUrl(token)}">Chart</a>`);
 
   return lines.join('\n');
+}
+
+function chartUrl(token) {
+  return `https://dexscreener.com/${token.chain}/${token.mint}`;
 }
 
 /** Inline buy buttons that carry the chain, so no manual /chain switch. */
@@ -127,7 +151,8 @@ function alertKeyboard(token) {
         callback_data: `abuy_${token.chain}_${token.mint}_${a}`,
       })),
       [
-        { text: '📊 Analysis', callback_data: `analyze_${token.chain}_${token.mint}` },
+        { text: '🔬 Re-scan', callback_data: `analyze_${token.chain}_${token.mint}` },
+        { text: '📈 Chart', url: chartUrl(token) },
         { text: '🔕 Mute', callback_data: 'alerts_off' },
       ],
     ],
@@ -147,4 +172,4 @@ function renderSmartMoneyAlert(token, wallets) {
   ].join('\n');
 }
 
-module.exports = { renderAlert, alertKeyboard, renderSmartMoneyAlert, money, price, compact, scoreBar, scoreEmoji, esc };
+module.exports = { renderAlert, alertKeyboard, renderSmartMoneyAlert, money, price, compact, scoreBar, scoreEmoji, esc, chartUrl };

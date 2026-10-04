@@ -1,8 +1,11 @@
 const axios = require('axios');
 const { VersionedTransaction, PublicKey } = require('@solana/web3.js');
+const bs58 = require('bs58').default || require('bs58');
 const logger = require('../../utils/logger');
+const { sleep, settle } = require('../../utils/async');
 
 const WSOL = 'So11111111111111111111111111111111111111112';
+const METADATA_PROGRAM = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 // Jupiter retired quote-api.jup.ag/v6 and price.jup.ag — the former now fails
 // to connect and the latter no longer resolves at all. The current free
 // endpoints are lite-api.jup.ag; api.jup.ag is the same API behind a key.
@@ -14,9 +17,12 @@ const JUPITER_HEADERS = process.env.JUPITER_API_KEY
   : {};
 
 const JITO_RPC = 'https://mainnet.block-engine.jito.wtf/api/v1/transactions';
+const CONFIRM_TIMEOUT_MS = 75_000;
+const REBROADCAST_MS = 2_000;
+const TOKEN_INFO_TTL_MS = 5 * 60 * 1000;
 
 /**
- * Solana swap adapter (Jupiter v6). Amounts crossing this boundary are always
+ * Solana swap adapter (Jupiter). Amounts crossing this boundary are always
  * RAW integer units — the router owns decimal conversion, not the caller.
  */
 class SolanaSwapAdapter {
@@ -25,13 +31,14 @@ class SolanaSwapAdapter {
     this.chain = 'solana';
     this.nativeMint = WSOL;
     this.nativeDecimals = 9;
+    this._infoCache = new Map();
   }
 
   async quote(inputMint, outputMint, rawAmount, slippageBps = 500) {
     const { data } = await axios.get(`${JUPITER_API}/quote`, {
       params: {
         inputMint, outputMint,
-        amount: Math.floor(rawAmount).toString(),
+        amount: BigInt(rawAmount).toString(),
         slippageBps,
         onlyDirectRoutes: false,
       },
@@ -41,6 +48,7 @@ class SolanaSwapAdapter {
     return {
       inAmount: Number(data.inAmount),
       outAmount: Number(data.outAmount),
+      rawOut: BigInt(data.outAmount),
       priceImpactPct: Number(data.priceImpactPct),
       raw: data,
     };
@@ -54,42 +62,83 @@ class SolanaSwapAdapter {
       userPublicKey: signer.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: 'auto',
+      dynamicSlippage: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: {
+          priorityLevel: 'veryHigh',
+          maxLamports: parseInt(process.env.SOLANA_MAX_PRIORITY_LAMPORTS, 10) || 2_000_000,
+        },
+      },
     }, { timeout: 15000, headers: JUPITER_HEADERS });
 
     const tx = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
     tx.sign([signer]);
 
-    // Try Jito bundle first (MEV-protected private mempool), fall back to RPC
-    let sig;
-    try {
-      sig = await this._sendViaJito(tx);
-      logger.info(`[sol] jito bundle landed ${sig}`);
-    } catch (jitoErr) {
-      logger.warn(`[sol] jito failed (${jitoErr.message}), falling back to RPC`);
-      sig = await this.connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
-    }
-
-    const conf = await this.connection.confirmTransaction(sig, 'confirmed');
-    if (conf.value?.err) throw new Error(`Swap reverted on-chain: ${JSON.stringify(conf.value.err)}`);
-
-    logger.info(`[sol] swap ${sig}`);
+    const sig = await this._sendAndConfirm(tx, data.lastValidBlockHeight);
+    logger.info(`[sol] swap confirmed ${sig}`);
     return {
       signature: sig,
       inputAmount: quote.inAmount,
       outputAmount: quote.outAmount,
+      rawOutput: quote.rawOut,
       priceImpactPct: quote.priceImpactPct,
     };
   }
 
-  async _sendViaJito(signedTx) {
-    const raw = Buffer.from(signedTx.serialize()).toString('base64');
+  /**
+   * Broadcast and confirm, bounded by the blockhash's validity window.
+   *
+   * The old path sent to Jito alone — which drops transactions that carry no
+   * tip, as Jupiter's do — logged "jito bundle landed" regardless, and then
+   * waited on the deprecated signature-only confirmTransaction, which has no
+   * expiry. Trades that never reached a leader showed up as a minute-long
+   * hang and then a timeout. Here the same signed transaction goes to the RPC
+   * and to Jito together (one signature, so it cannot execute twice), is
+   * rebroadcast until it lands, and gives up the moment its blockhash expires.
+   */
+  async _sendAndConfirm(tx, lastValidBlockHeight) {
+    const raw = Buffer.from(tx.serialize());
+    const sig = bs58.encode(tx.signatures[0]);
+    const useJito = process.env.SOLANA_USE_JITO !== 'false';
+
+    const broadcast = () => Promise.allSettled([
+      this.connection.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }),
+      useJito ? this._sendViaJito(raw) : Promise.resolve(),
+    ]);
+
+    const first = await broadcast();
+    if (first[0].status === 'rejected' && (!useJito || first[1].status === 'rejected')) {
+      throw new Error(`Could not broadcast: ${first[0].reason?.message || first[0].reason}`);
+    }
+
+    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    let loops = 0;
+    while (Date.now() < deadline) {
+      await sleep(REBROADCAST_MS);
+      loops++;
+      const st = await settle(this.connection.getSignatureStatuses([sig]), 5000, null);
+      const s = st?.value?.[0];
+      if (s?.err) throw new Error(`Swap failed on-chain: ${JSON.stringify(s.err)} (${sig})`);
+      if (s?.confirmationStatus === 'confirmed' || s?.confirmationStatus === 'finalized') return sig;
+
+      if (lastValidBlockHeight && loops % 3 === 0) {
+        const height = await settle(this.connection.getBlockHeight('confirmed'), 5000, null);
+        if (height && height > lastValidBlockHeight) {
+          throw new Error(`Transaction expired before landing — network congested, try again (${sig})`);
+        }
+      }
+      broadcast(); // not awaited: rebroadcast is fire-and-forget
+    }
+    throw new Error(`Not confirmed within ${CONFIRM_TIMEOUT_MS / 1000}s — check ${sig} before retrying`);
+  }
+
+  async _sendViaJito(rawBuf) {
     const { data } = await axios.post(JITO_RPC, {
       jsonrpc: '2.0',
       id: 1,
       method: 'sendTransaction',
-      params: [raw, { encoding: 'base64' }],
-    }, { timeout: 10000 });
+      params: [rawBuf.toString('base64'), { encoding: 'base64' }],
+    }, { timeout: 5000 });
     if (data.error) throw new Error(data.error.message || 'Jito rejected');
     return data.result;
   }
@@ -101,7 +150,7 @@ class SolanaSwapAdapter {
 
   /** rawTokenAmount in RAW units; returns outputAmount in RAW lamports. */
   async sell(signer, mint, rawTokenAmount, slippageBps) {
-    return this._swap(signer, mint, WSOL, Math.floor(Number(rawTokenAmount)), slippageBps);
+    return this._swap(signer, mint, WSOL, BigInt(rawTokenAmount), slippageBps);
   }
 
   /** Price in USD, or null if Jupiter has no route yet. */
@@ -120,72 +169,84 @@ class SolanaSwapAdapter {
     }
   }
 
+  /**
+   * Mint facts in ONE RPC call: the parsed mint (authorities, supply,
+   * decimals, Token-2022 extensions) plus the Metaplex metadata account.
+   *
+   * Most pump tokens are now Token-2022 with the name in the mint's own
+   * tokenMetadata extension — the Metaplex-only lookup found nothing for
+   * them, which is why so many alerts said UNKNOWN.
+   */
   async getTokenInfo(mint) {
+    const hit = this._infoCache.get(mint);
+    if (hit && hit.expires > Date.now()) return hit.value;
+    const value = await this._fetchTokenInfo(mint);
+    if (value) {
+      if (this._infoCache.size > 2000) this._infoCache.clear();
+      this._infoCache.set(mint, { value, expires: Date.now() + TOKEN_INFO_TTL_MS });
+    }
+    return value;
+  }
+
+  async _fetchTokenInfo(mint) {
     try {
       const mintPk = new PublicKey(mint);
-      const METADATA_PROGRAM = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
       const [metaPda] = PublicKey.findProgramAddressSync(
         [Buffer.from('metadata'), METADATA_PROGRAM.toBuffer(), mintPk.toBuffer()],
         METADATA_PROGRAM,
       );
-      const [supply, info, metaAccount] = await Promise.all([
-        this.connection.getTokenSupply(mintPk),
-        this.connection.getParsedAccountInfo(mintPk),
-        this.connection.getAccountInfo(metaPda).catch(() => null),
-      ]);
-      const parsed = info?.value?.data?.parsed?.info;
+      const { value: [mintAcct, metaAcct] } = await this.connection.getMultipleParsedAccounts([mintPk, metaPda]);
+      const info = mintAcct?.data?.parsed?.info;
+      if (!info || mintAcct.data.parsed.type !== 'mint') return null;
 
-      let symbol = null;
-      let name = null;
-      if (metaAccount?.data) {
-        try {
-          const d = metaAccount.data;
-          const nameLen = d.readUInt32LE(65);
-          name = d.slice(69, 69 + nameLen).toString('utf8').replace(/\0/g, '').trim() || null;
-          const symOffset = 69 + nameLen;
-          const symLen = d.readUInt32LE(symOffset);
-          symbol = d.slice(symOffset + 4, symOffset + 4 + symLen).toString('utf8').replace(/\0/g, '').trim() || null;
-        } catch {}
+      const ext = {};
+      for (const e of info.extensions || []) ext[e.extension] = e.state || {};
+
+      let symbol = ext.tokenMetadata?.symbol || null;
+      let name = ext.tokenMetadata?.name || null;
+      if ((!symbol || !name) && Buffer.isBuffer(metaAcct?.data)) {
+        const meta = parseMetaplex(metaAcct.data);
+        symbol = symbol || meta.symbol;
+        name = name || meta.name;
       }
 
+      const decimals = info.decimals;
+      const rawSupply = String(info.supply);
       return {
-        symbol,
-        name,
-        decimals: supply.value.decimals,
-        totalSupply: Number(supply.value.uiAmount),
-        rawSupply: supply.value.amount,
-        mintAuthorityRevoked: !parsed?.mintAuthority,
-        freezeAuthorityRevoked: !parsed?.freezeAuthority,
+        symbol: clean(symbol),
+        name: clean(name),
+        decimals,
+        rawSupply,
+        totalSupply: Number(rawSupply) / 10 ** decimals,
+        mintAuthorityRevoked: !info.mintAuthority,
+        freezeAuthorityRevoked: !info.freezeAuthority,
+        token2022: mintAcct.data.program === 'spl-token-2022',
+        extensions: ext,
       };
     } catch (err) {
-      logger.error(`[sol] token info ${mint}: ${err.message}`);
+      logger.warn(`[sol] token info ${mint}: ${err.message}`);
       return null;
     }
   }
 
   /**
-   * Sellability probe. Ask Jupiter to route a small sell of the token back to
-   * SOL; if no route exists or the quote round-trips at a catastrophic loss,
-   * the token is effectively a honeypot. Costs nothing — quote only, no tx.
-   */
-  /**
    * Sellability probe. Returns sellable:null for UNKNOWN — an API failure is
    * not evidence of a honeypot, and treating it as one condemned every token
    * the moment Jupiter's endpoint moved.
    */
-  async checkSellable(mint, decimals = 9) {
+  async checkSellable(mint) {
     let buyQuote;
     try {
       buyQuote = await this.quote(WSOL, mint, 1e8, 1500); // 0.1 SOL in
     } catch (err) {
       // No route yet is normal for a pool seconds old; a network error tells
       // us nothing about the token. Either way: unknown, not guilty.
-      return { sellable: null, reason: `buy probe failed: ${err.message}` };
+      return { sellable: null, reason: `buy probe failed: ${shortErr(err)}` };
     }
     if (!buyQuote.outAmount) return { sellable: null, reason: 'no buy route yet' };
 
     try {
-      const sellQuote = await this.quote(mint, WSOL, buyQuote.outAmount, 1500);
+      const sellQuote = await this.quote(mint, WSOL, buyQuote.rawOut, 1500);
       if (!sellQuote.outAmount) {
         return { sellable: false, reason: 'no sell route while a buy route exists' };
       }
@@ -193,14 +254,40 @@ class SolanaSwapAdapter {
       return {
         sellable: true,
         roundTripLossPct: roundTripLoss * 100,
+        priceImpactPct: buyQuote.priceImpactPct * 100,
         reason: null,
       };
     } catch (err) {
-      // A buy route exists but the sell quote errors — that asymmetry is the
-      // actual honeypot signature.
-      return { sellable: false, reason: `sell quote failed: ${err.message}` };
+      // An HTTP/network failure on the second call says nothing about the
+      // token. Only Jupiter positively saying "no route" for the sell side
+      // while the buy side routes is the honeypot signature.
+      const status = err.response?.status;
+      const body = JSON.stringify(err.response?.data || '');
+      if (status === 400 && /route|liquidity|TOKEN_NOT_TRADABLE/i.test(body)) {
+        return { sellable: false, reason: `sell quote refused: ${body.slice(0, 80)}` };
+      }
+      return { sellable: null, reason: `sell probe failed: ${shortErr(err)}` };
     }
   }
 }
+
+function parseMetaplex(d) {
+  try {
+    const nameLen = d.readUInt32LE(65);
+    const name = d.subarray(69, 69 + nameLen).toString('utf8');
+    const symOffset = 69 + nameLen;
+    const symLen = d.readUInt32LE(symOffset);
+    const symbol = d.subarray(symOffset + 4, symOffset + 4 + symLen).toString('utf8');
+    return { name, symbol };
+  } catch {
+    return {};
+  }
+}
+
+const clean = (s) => (s ? s.replace(/\0/g, '').trim() || null : null);
+const shortErr = (err) => {
+  const status = err.response?.status;
+  return status ? `HTTP ${status}` : (err.code || err.message || String(err)).slice(0, 60);
+};
 
 module.exports = SolanaSwapAdapter;

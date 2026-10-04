@@ -2,6 +2,7 @@ const { ethers } = require('ethers');
 const logger = require('../../utils/logger');
 const CHAINS = require('../chains');
 const { getEvmProvider, getEvmWsUrl, ReconnectingLogWatcher } = require('../evmProvider');
+const stats = require('../stats');
 
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
@@ -43,6 +44,25 @@ const SETTLE_ALL = 0x0e;
 const TAKE_ALL = 0x0f;
 const ZERO = '0x0000000000000000000000000000000000000000';
 
+// V4 marks a pool whose fee is set by its hook with this bit in the fee field.
+// The raw value 8388608 is NOT a fee — reading it as one reported an "838%
+// swap fee" and zeroed the safety score of every dynamic-fee pool.
+const DYNAMIC_FEE_FLAG = 0x800000;
+
+const QUOTE_TTL_MS = 8000;
+const TOKEN_INFO_TTL_MS = 5 * 60 * 1000;
+// After an outage, replaying more than this many blocks of pools would alert
+// on tokens that are already old news (Robinhood Chain runs ~10 blocks/s).
+const MAX_CATCHUP_BLOCKS = 18000;
+const LOG_CHUNK_BLOCKS = 5000;
+
+/** Fee in percent, or null for a dynamic-fee pool whose fee lives in its hook. */
+function poolFeePct(fee) {
+  const f = Number(fee);
+  if (!Number.isFinite(f) || (f & DYNAMIC_FEE_FLAG)) return null;
+  return f / 10000;
+}
+
 /**
  * Robinhood Chain swap adapter (Uniswap V4 via UniversalRouter).
  * Mirrors SolanaSwapAdapter's interface: raw amounts in, raw amounts out.
@@ -65,6 +85,8 @@ class EvmSwapAdapter {
     this.provider = getEvmProvider(chainConfig);
     this._decimalsCache = new Map();
     this._pools = new Map();
+    this._quoteCache = new Map();
+    this._infoCache = new Map();
   }
 
   /**
@@ -134,11 +156,30 @@ class EvmSwapAdapter {
     return d;
   }
 
-  /** Quote via the V4 quoter. amountIn/out are RAW units. */
-  async quote(tokenAddress, rawAmountIn, isBuy, poolKeyOverride) {
+  /**
+   * Quote via the V4 quoter. amountIn/out are RAW units.
+   *
+   * Memoised for a few seconds: one analysis asks for the same 0.01 ETH buy
+   * quote from the price, sellability and depth checks. On a rate-limited
+   * public RPC, sharing it is the difference between 3 calls and 5.
+   */
+  quote(tokenAddress, rawAmountIn, isBuy, poolKeyOverride) {
     const pk = this._poolKey(tokenAddress, poolKeyOverride);
-    if (!pk) throw new PoolUnknownError(tokenAddress);
+    if (!pk) return Promise.reject(new PoolUnknownError(tokenAddress));
 
+    const key = [tokenAddress.toLowerCase(), String(rawAmountIn), isBuy, pk.fee, pk.tickSpacing, pk.hooks].join(':');
+    const hit = this._quoteCache.get(key);
+    if (hit && hit.expires > Date.now()) return hit.promise;
+
+    const promise = this._quote(tokenAddress, rawAmountIn, isBuy, pk);
+    if (this._quoteCache.size > 500) this._quoteCache.clear();
+    this._quoteCache.set(key, { promise, expires: Date.now() + QUOTE_TTL_MS });
+    // A failed quote must not be served from cache to the next caller.
+    promise.catch(() => this._quoteCache.delete(key));
+    return promise;
+  }
+
+  async _quote(tokenAddress, rawAmountIn, isBuy, pk) {
     // Buying the token means spending the native side, so zeroForOne is true
     // when the native currency is currency0.
     const zeroForOne = isBuy ? !pk.tokenIsCurrency0 : pk.tokenIsCurrency0;
@@ -166,7 +207,8 @@ class EvmSwapAdapter {
 
     let minOut = 0n;
     try {
-      const q = await this.quote(tokenAddress, amountIn, true, pk);
+      // Fresh quote, not the memoised one: minOut must reflect the pool now.
+      const q = await this._quote(tokenAddress, amountIn, true, pk);
       minOut = (q.rawOut * BigInt(10000 - slippageBps)) / 10000n;
     } catch (err) {
       logger.warn(`[rh] quote failed, sending with no minOut: ${err.message}`);
@@ -225,7 +267,7 @@ class EvmSwapAdapter {
 
     let minOut = 0n;
     try {
-      const q = await this.quote(tokenAddress, amountIn, false, pk);
+      const q = await this._quote(tokenAddress, amountIn, false, pk);
       minOut = (q.rawOut * BigInt(10000 - slippageBps)) / 10000n;
     } catch (err) {
       logger.warn(`[rh] sell quote failed: ${err.message}`);
@@ -271,14 +313,37 @@ class EvmSwapAdapter {
   }
 
   async getTokenInfo(tokenAddress) {
+    const key = tokenAddress.toLowerCase();
+    const hit = this._infoCache.get(key);
+    if (hit && hit.expires > Date.now()) return hit.value;
+    const value = await this._fetchTokenInfo(tokenAddress);
+    if (value) {
+      if (this._infoCache.size > 2000) this._infoCache.clear();
+      this._infoCache.set(key, { value, expires: Date.now() + TOKEN_INFO_TTL_MS });
+      this._decimalsCache.set(key, value.decimals);
+    }
+    return value;
+  }
+
+  async _fetchTokenInfo(tokenAddress) {
+    const token = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
+    // A REVERT means the function does not exist; any other failure means the
+    // RPC did not answer. Only the first is evidence about the token. Folding
+    // both into a default made a rate-limited RPC report every token as
+    // "owner renounced" — the failure made tokens look safer.
+    const reverted = (err) => err?.code === 'CALL_EXCEPTION' || err?.code === 'BAD_DATA';
+    const optional = (p, fallback) => p.catch(err => {
+      if (reverted(err)) return fallback;
+      throw err;
+    });
     try {
-      const token = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
+      // totalSupply is mandatory: a contract without it is not an ERC20.
       const [symbol, name, decimals, totalSupply, owner] = await Promise.all([
-        token.symbol().catch(() => 'UNKNOWN'),
-        token.name().catch(() => 'Unknown'),
-        token.decimals().catch(() => 18),
-        token.totalSupply().catch(() => 0n),
-        token.owner().catch(() => null),
+        optional(token.symbol(), 'UNKNOWN'),
+        optional(token.name(), null),
+        optional(token.decimals(), 18n),
+        token.totalSupply(),
+        optional(token.owner(), null),
       ]);
       return {
         symbol, name,
@@ -291,9 +356,25 @@ class EvmSwapAdapter {
         owner,
       };
     } catch (err) {
-      logger.error(`[rh] token info ${tokenAddress}: ${err.message}`);
+      logger.warn(`[rh] token info ${tokenAddress}: ${err.shortMessage || err.message}`);
       return null;
     }
+  }
+
+  /** Raw ERC20 balance, or null when it cannot be read. */
+  async balanceOf(tokenAddress, holder) {
+    try {
+      const token = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
+      return await token.balanceOf(holder);
+    } catch {
+      return null;
+    }
+  }
+
+  /** The externally-owned account that sent a transaction — the deployer. */
+  async getTxSender(txHash) {
+    const tx = await this.provider.getTransaction(txHash);
+    return tx?.from || null;
   }
 
   /**
@@ -326,7 +407,8 @@ class EvmSwapAdapter {
       return {
         sellable: true,
         roundTripLossPct: roundTripLoss * 100,
-        feePct: pk.fee / 10000,
+        feePct: poolFeePct(pk.fee),
+        dynamicFee: poolFeePct(pk.fee) === null,
         reason: null,
       };
     } catch (err) {
@@ -367,23 +449,25 @@ class EvmSwapAdapter {
 
   /**
    * Watch for new V4 pools. Prefers a WebSocket subscription — the chain pushes
-   * events the moment they land, so detection is near-instant and costs no
-   * polling requests. Falls back to HTTP polling when no WebSocket endpoint is
-   * configured (the public RPC has none), which is correct but up to one
-   * polling interval late on every pool.
+   * events the moment they land. Without one it polls eth_getLogs directly.
+   *
+   * The poller is ours rather than ethers' contract.on(): ethers' HTTP event
+   * polling swallows failures into an 'error' event and gives no way to tell
+   * "no pools" from "not polling", which is the exact silence this bot has
+   * been bitten by. Here every successful poll is reported (`onPoll`) so the
+   * health monitor can tell the two apart, and a gap is caught up on recovery.
    */
-  onNewPool(callback) {
-    const handler = async (id, currency0, currency1, fee, tickSpacing, hooks) => {
-      const weth = this.config.weth.toLowerCase();
+  onNewPool(callback, { onPoll } = {}) {
+    const weth = this.config.weth.toLowerCase();
+    const isNative = (a) => a === ZERO || a === weth;
+
+    const handle = async (currency0, currency1, fee, tickSpacing, hooks, id, txHash) => {
       const c0 = currency0.toLowerCase();
       const c1 = currency1.toLowerCase();
-
       // Pools pair against native ETH (address(0)) far more often than WETH.
-      const isNative = (a) => a === ZERO || a === weth;
       if (!isNative(c0) && !isNative(c1)) return;
-
       const tokenAddress = isNative(c0) ? currency1 : currency0;
-      if (tokenAddress.toLowerCase() === ZERO) return; // both sides native
+      if (isNative(tokenAddress.toLowerCase())) return; // both sides native
 
       const poolKey = {
         currency0, currency1,
@@ -392,7 +476,7 @@ class EvmSwapAdapter {
         hooks,
       };
       this.rememberPool(tokenAddress, poolKey);
-      await callback({ tokenAddress, poolId: id, poolKey });
+      await callback({ tokenAddress, poolId: id, poolKey, txHash });
     };
 
     const wsUrl = getEvmWsUrl(this.config);
@@ -403,26 +487,70 @@ class EvmSwapAdapter {
         address: this.config.poolManager,
         abi: POOL_MANAGER_ABI,
         event: 'Initialize',
-        onEvent: handler,
+        // ethers passes the decoded args, then a payload carrying the raw log.
+        onEvent: (id, c0, c1, fee, spacing, hooks, _sqrt, _tick, payload) =>
+          handle(c0, c1, fee, spacing, hooks, id, payload?.log?.transactionHash),
+        onBlock: onPoll,
         label: 'rh',
       });
       this.poolWatcher.start();
       return;
     }
 
-    const poolManager = new ethers.Contract(this.config.poolManager, POOL_MANAGER_ABI, this.provider);
-    poolManager.on('Initialize', (...args) => {
-      handler(...args).catch(err => logger.error(`[rh] pool handler: ${err.message}`));
-    });
-    this.poolContract = poolManager;
-    logger.warn('[rh] no websocket endpoint — falling back to HTTP polling for pool detection');
+    logger.warn('[rh] no websocket endpoint — polling eth_getLogs for new pools');
+    this._startLogPoller(handle, onPoll);
+  }
+
+  _startLogPoller(handle, onPoll) {
+    const iface = new ethers.Interface(POOL_MANAGER_ABI);
+    const topic = iface.getEvent('Initialize').topicHash;
+    const intervalMs = parseInt(process.env.EVM_POLLING_INTERVAL_MS, 10) || 5000;
+    let from = null;
+    this._polling = true;
+
+    const tick = async () => {
+      if (!this._polling) return;
+      try {
+        const head = await this.provider.getBlockNumber();
+        if (from === null) from = head - 20;
+        if (head - from > MAX_CATCHUP_BLOCKS) {
+          logger.warn(`[rh] ${head - from} blocks behind — skipping ahead, older pools are stale`);
+          stats.inc('robinhood', 'poll_skipped_ahead');
+          from = head - 600;
+        }
+        while (from <= head && this._polling) {
+          const to = Math.min(head, from + LOG_CHUNK_BLOCKS);
+          const logs = await this.provider.getLogs({
+            address: this.config.poolManager, topics: [topic], fromBlock: from, toBlock: to,
+          });
+          from = to + 1;
+          for (const log of logs) {
+            const ev = iface.parseLog(log);
+            const [id, c0, c1, fee, spacing, hooks] = ev.args;
+            handle(c0, c1, fee, spacing, hooks, id, log.transactionHash)
+              .catch(err => logger.error(`[rh] pool handler: ${err.message}`));
+          }
+        }
+        onPoll?.();
+      } catch (err) {
+        stats.inc('robinhood', 'poll_error', 1, err.shortMessage || err.message);
+      } finally {
+        if (this._polling) {
+          this._pollTimer = setTimeout(tick, intervalMs);
+          this._pollTimer.unref?.();
+        }
+      }
+    };
+    tick();
   }
 
   stopWatching() {
     this.poolWatcher?.stop();
-    try { this.poolContract?.removeAllListeners(); } catch { /* already gone */ }
+    this._polling = false;
+    clearTimeout(this._pollTimer);
   }
 }
 
 module.exports = EvmSwapAdapter;
 module.exports.PoolUnknownError = PoolUnknownError;
+module.exports.poolFeePct = poolFeePct;

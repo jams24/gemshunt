@@ -1,6 +1,7 @@
 const logger = require('../utils/logger');
 const db = require('../db/database');
 const CHAINS = require('../services/chains');
+const { singleFlight, settle } = require('../utils/async');
 
 /**
  * Buy/sell logic and position management. Deliberately knows nothing about
@@ -22,6 +23,13 @@ class TradeEngine {
     this.slPct = -50;
 
     this.onTradeEvent = null;
+
+    // The monitor runs on an interval, and one sweep that includes sells can
+    // easily outlast it. Two overlapping sweeps would both see the same TP
+    // trigger and both sell. Overlapping calls are skipped instead.
+    this.checkAllPositions = singleFlight(this._checkAllPositions.bind(this));
+    // Per-position lock so a manual sell and the monitor can't race either.
+    this._busy = new Set();
   }
 
   // ------------------------------------------------------------ helpers
@@ -117,18 +125,29 @@ class TradeEngine {
 
   // -------------------------------------------------------------- sell
 
-  async sellToken(userId, mint, fraction = 1.0) {
+  async sellToken(userId, mint, fraction = 1.0, chain) {
     const user = await db.getUser(userId);
     if (!user) throw new Error('Not registered. Send /start first.');
 
     const positions = await db.getUserPositions(userId, 'open');
-    const pos = positions.find(p => p.mint === mint);
+    const lower = mint.toLowerCase();
+    const pos = positions.find(p => (p.mint === mint || p.mint.toLowerCase() === lower) && (!chain || p.chain === chain));
     if (!pos) throw new Error('No open position in that token');
 
     return this._executeSell(pos, user, fraction, 'MANUAL', user.slippage_bps || this.config.trading.slippageBps);
   }
 
   async _executeSell(pos, user, fraction, reason, slippage) {
+    if (this._busy.has(pos.id)) throw new Error('A sell for this position is already in progress');
+    this._busy.add(pos.id);
+    try {
+      return await this._doSell(pos, user, fraction, reason, slippage);
+    } finally {
+      this._busy.delete(pos.id);
+    }
+  }
+
+  async _doSell(pos, user, fraction, reason, slippage) {
     const chain = pos.chain || 'solana';
     const wallet = this._walletFor(user, chain);
 
@@ -196,14 +215,14 @@ class TradeEngine {
 
   // --------------------------------------------------- position monitor
 
-  async checkAllPositions() {
+  async _checkAllPositions() {
     const positions = await db.getAllOpenPositions();
     if (!positions.length) return;
 
     // Cache native prices once per sweep instead of per position.
     const nativePrices = {};
     for (const chain of this.swap.chains()) {
-      nativePrices[chain] = await this.swap.getNativePriceUsd(chain).catch(() => null);
+      nativePrices[chain] = await settle(this.swap.getNativePriceUsd(chain), 8000, null);
     }
 
     for (const pos of positions) {
@@ -217,7 +236,8 @@ class TradeEngine {
 
   async _checkPosition(pos, nativePrices) {
     const chain = pos.chain || 'solana';
-    const priceUsd = await this.swap.getPrice(chain, pos.mint);
+    if (this._busy.has(pos.id)) return;
+    const priceUsd = await settle(this.swap.getPrice(chain, pos.mint), 15000, null);
     if (priceUsd == null) return;
 
     const nativeUsd = nativePrices[chain];
@@ -247,17 +267,25 @@ class TradeEngine {
     const slippage = user.slippage_bps || this.config.trading.slippageBps;
     const fresh = { ...pos, token_amount_raw: pos.token_amount_raw, sol_received: pos.sol_received };
 
-    if (multiple >= this.tp3x && !pos.tp3_hit) {
-      await db.updatePosition(pos.id, { tp3_hit: true });
-      await this._executeSell(fresh, user, 1.0, 'TP3', slippage);
-    } else if (multiple >= this.tp2x && !pos.tp2_hit) {
-      await db.updatePosition(pos.id, { tp2_hit: true });
-      await this._executeSell(fresh, user, 0.3, 'TP2', slippage);
-    } else if (multiple >= this.tp1x && !pos.tp1_hit) {
-      await db.updatePosition(pos.id, { tp1_hit: true });
-      await this._executeSell(fresh, user, 0.3, 'TP1', slippage);
-    } else if (pnlPct <= this.slPct) {
-      await this._executeSell(fresh, user, 1.0, 'SL', slippage);
+    // The TP flag is written only AFTER the sell succeeds. Setting it first
+    // meant one failed sell (RPC hiccup, slippage) consumed that TP level
+    // forever — the position just rode back down.
+    const ladder = [
+      { hit: multiple >= this.tp3x && !pos.tp3_hit, flag: 'tp3_hit', fraction: 1.0, reason: 'TP3' },
+      { hit: multiple >= this.tp2x && !pos.tp2_hit, flag: 'tp2_hit', fraction: 0.3, reason: 'TP2' },
+      { hit: multiple >= this.tp1x && !pos.tp1_hit, flag: 'tp1_hit', fraction: 0.3, reason: 'TP1' },
+      { hit: pnlPct <= this.slPct, flag: null, fraction: 1.0, reason: 'SL' },
+    ];
+    const step = ladder.find(l => l.hit);
+    if (!step) return;
+    try {
+      await this._executeSell(fresh, user, step.fraction, step.reason, slippage);
+      if (step.flag) await db.updatePosition(pos.id, { [step.flag]: true });
+    } catch (err) {
+      logger.error(`[monitor] ${step.reason} sell failed for ${pos.symbol} (${chain}), will retry: ${err.message}`);
+      if (this.onTradeEvent) {
+        this.onTradeEvent({ type: 'sell_failed', reason: step.reason, userId: pos.user_id, chain, position: pos, error: err.message });
+      }
     }
   }
 }

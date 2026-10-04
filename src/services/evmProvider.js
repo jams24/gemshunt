@@ -277,8 +277,8 @@ function getEvmWsUrl(chainConfig) {
  * detects death, and rebuilds provider + listener with backoff.
  */
 class ReconnectingLogWatcher {
-  constructor({ wsUrl, chainId, address, abi, event, onEvent, label = 'evm' }) {
-    Object.assign(this, { wsUrl, chainId, address, abi, event, onEvent, label });
+  constructor({ wsUrl, chainId, address, abi, event, onEvent, onBlock, label = 'evm' }) {
+    Object.assign(this, { wsUrl, chainId, address, abi, event, onEvent, onBlock, label });
     this.provider = null;
     this.contract = null;
     this.stopped = false;
@@ -317,6 +317,7 @@ class ReconnectingLogWatcher {
       this.lastBlockAt = Date.now();
       this.provider.on('block', () => {
         this.lastBlockAt = Date.now();
+        try { this.onBlock?.(); } catch { /* liveness hook only */ }
         // Only a delivered block proves the socket actually works. Resetting
         // backoff at subscribe time instead would let a flapping endpoint be
         // retried at full speed forever.

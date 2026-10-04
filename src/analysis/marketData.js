@@ -3,11 +3,14 @@ const logger = require('../utils/logger');
 
 const DEXSCREENER = 'https://api.dexscreener.com/latest/dex/tokens';
 const CACHE_TTL_MS = 30 * 1000;
+// "Not indexed yet" is the normal answer for a pool seconds old, and it
+// changes within minutes — cache it briefly so re-checks see the pair appear.
+const MISS_TTL_MS = 10 * 1000;
 
-// DexScreener's chain slugs. Robinhood Chain is not indexed there today, so
-// every EVM lookup returns null and the scorer simply weights social/volume at
-// zero rather than penalising the token.
-const DEX_CHAIN_SLUG = { solana: 'solana', robinhood: null };
+// DexScreener's chain slugs. Robinhood Chain IS indexed (chainId "robinhood"),
+// typically within ~3 minutes of a pool's creation; this used to be null, so
+// Robinhood tokens never had market data at all.
+const DEX_CHAIN_SLUG = { solana: 'solana', robinhood: 'robinhood' };
 
 /**
  * Free-tier market data. Everything here is best-effort: any provider failure
@@ -27,7 +30,7 @@ class MarketData {
 
   _store(key, value) {
     if (this.cache.size > 2000) this.cache.clear();
-    this.cache.set(key, { value, expires: Date.now() + CACHE_TTL_MS });
+    this.cache.set(key, { value, expires: Date.now() + (value ? CACHE_TTL_MS : MISS_TTL_MS) });
     return value;
   }
 
@@ -47,6 +50,7 @@ class MarketData {
     try {
       const { data } = await axios.get(`${DEXSCREENER}/${mint}`, { timeout: 6000 });
       const pairs = (data?.pairs || []).filter(p => p.chainId === slug);
+      this.lastOkAt = Date.now();
       if (!pairs.length) return this._store(key, null);
 
       // Deepest pool is the honest one — thin side-pools give garbage prices.
@@ -69,6 +73,8 @@ class MarketData {
         volume1h: pair.volume?.h1 || 0,
         buys5m: pair.txns?.m5?.buys || 0,
         sells5m: pair.txns?.m5?.sells || 0,
+        buys1h: pair.txns?.h1?.buys || 0,
+        sells1h: pair.txns?.h1?.sells || 0,
         priceChange5m: pair.priceChange?.m5 || 0,
         priceChange1h: pair.priceChange?.h1 || 0,
         pairCreatedAt: pair.pairCreatedAt || null,
@@ -76,8 +82,11 @@ class MarketData {
         boosts: pair.boosts?.active || 0,
       });
     } catch (err) {
+      // A provider failure is not "no pair" — don't cache it, and record it so
+      // a dead DexScreener is visible rather than looking like a quiet market.
+      this.lastError = { at: Date.now(), message: err.response?.status ? `HTTP ${err.response.status}` : err.message };
       logger.debug?.(`[market] ${chain}/${mint}: ${err.message}`);
-      return this._store(key, null);
+      return null;
     }
   }
 

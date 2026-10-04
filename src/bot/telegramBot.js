@@ -3,13 +3,16 @@ const logger = require('../utils/logger');
 const db = require('../db/database');
 const CHAINS = require('../services/chains');
 const { generateTradeCard, generateMonthlyCard, formatHoldTime } = require('../services/pnlCard');
-const { renderAlert, money, scoreBar, scoreEmoji } = require('../analysis/thesis');
+const { renderAlert, money, scoreBar, scoreEmoji, esc } = require('../analysis/thesis');
+const { withTimeout, sleep } = require('../utils/async');
 
 const REFERRAL_FEE_SHARE = parseFloat(process.env.REFERRAL_FEE_SHARE) || 0.25;
 
 class TelegramBot {
   constructor({ tradeEngine, walletManager, swapRouter, analyzer, tracker, config }) {
-    this.bot = new Telegraf(config.telegram.token);
+    // Handlers are detached (see setupMiddleware), so this timeout no longer
+    // gates the polling loop; it only bounds a single runaway handler.
+    this.bot = new Telegraf(config.telegram.token, { handlerTimeout: 10 * 60 * 1000 });
     this.engine = tradeEngine;
     this.walletManager = walletManager;
     this.swap = swapRouter;
@@ -19,18 +22,56 @@ class TelegramBot {
     this.feePct = config.trading.platformFeePct;
     this.adminId = config.telegram.adminId;
     this.pendingImport = new Map();
+    this.scanner = null;
+    this.health = null;
+    this._stopping = false;
+    this._sellFailNotified = new Map();
     this.setupMiddleware();
     this.setupCommands();
     this.setupCallbacks();
     this.hookTradeEvents();
   }
 
+  /** Late-bound services the bot reports on but does not own. */
+  attach({ scanner, health }) {
+    this.scanner = scanner;
+    this.health = health;
+  }
+
   setupMiddleware() {
+    // Detach every update from Telegraf's polling loop.
+    //
+    // Telegraf fetches updates in batches and awaits ALL handlers in a batch
+    // before fetching the next. One user's 30-second buy therefore froze the
+    // bot for everyone, and a handler that passed the 90s handlerTimeout threw
+    // a TimeoutError that — with no bot.catch — ended polling for good. The
+    // process kept running and alerting, but never answered a command again.
+    this.bot.use((ctx, next) => {
+      Promise.resolve()
+        .then(() => next())
+        .catch(err => this._handleError(err, ctx));
+    });
+
     this.bot.use(async (ctx, next) => {
       if (!ctx.from) return;
-      await db.getOrCreateUser(ctx.from.id, ctx.from.username);
+      await withTimeout(db.getOrCreateUser(ctx.from.id, ctx.from.username), 10000, 'user lookup');
       return next();
     });
+
+    // Belt and braces: anything that still reaches Telegraf's error path is
+    // logged, never rethrown into the polling loop.
+    this.bot.catch((err, ctx) => this._handleError(err, ctx));
+  }
+
+  _handleError(err, ctx) {
+    const msg = err?.description || err?.message || String(err);
+    // Harmless Telegram complaints: a double-tapped button re-rendering the
+    // same text, or answering a callback after its 15s window.
+    if (/message is not modified|query is too old|query ID is invalid|message to edit not found/i.test(msg)) return;
+    logger.error(`[bot] update ${ctx?.updateType || '?'} from ${ctx?.from?.id || '?'} failed: ${msg}`);
+    if (ctx?.chat?.id) {
+      ctx.reply('⚠️ Something went wrong handling that — please try again.').catch(() => {});
+    }
   }
 
   // === HELPERS ===
@@ -232,6 +273,7 @@ class TelegramBot {
         `/export — Private key\n\n` +
         `<b>Alerts & Research:</b>\n` +
         `/alerts — Alert settings\n` +
+        `/setscore <code>0-100</code> · /setliq <code>usd</code>\n` +
         `/scan <code>address</code> — Analyze a token\n` +
         `/watch <code>wallet</code> — Track smart money\n` +
         `/watchlist — Tracked wallets\n\n` +
@@ -338,7 +380,7 @@ class TelegramBot {
         const buttons = positions.map(p => [
           Markup.button.callback(
             `${(p.pnl_pct || 0) >= 0 ? '🟢' : '🔴'} ${p.symbol || p.mint.slice(0, 8)} | ${(p.pnl_pct || 0) >= 0 ? '+' : ''}${(p.pnl_pct || 0).toFixed(0)}%`,
-            `sellmenu_${p.mint.slice(0, 40)}`
+            `sellmenu_${p.mint}`
           ),
         ]);
         return ctx.replyWithHTML('<b>Select position to sell:</b>', Markup.inlineKeyboard(buttons));
@@ -354,7 +396,7 @@ class TelegramBot {
       if (!positions.length) return ctx.reply('No open positions.');
       ctx.reply(`Closing ${positions.length} positions...`);
       for (const pos of positions) {
-        try { await this.engine.sellToken(ctx.from.id, pos.mint, 1.0); } catch (e) { ctx.reply(`❌ ${pos.symbol}: ${e.message}`); }
+        try { await this.engine.sellToken(ctx.from.id, pos.mint, 1.0, pos.chain); } catch (e) { ctx.reply(`❌ ${pos.symbol}: ${e.message}`); }
       }
       ctx.reply('✅ Done.');
     });
@@ -368,7 +410,7 @@ class TelegramBot {
       for (const p of positions) {
         const c = CHAINS[p.chain || 'solana'];
         const emoji = (p.pnl_pct || 0) >= 0 ? (p.pnl_pct > 50 ? '🟢' : '🔵') : '🔴';
-        msg += `${emoji} ${c?.emoji || ''} <b>${p.symbol || p.mint.slice(0, 8)}</b>\n`;
+        msg += `${emoji} ${c?.emoji || ''} <b>${esc(p.symbol || p.mint.slice(0, 8))}</b>\n`;
         msg += `  ${(p.pnl_pct || 0) >= 0 ? '+' : ''}${(p.pnl_pct || 0).toFixed(1)}% | ${(p.current_mc || 0).toFixed(1)}x | ${formatHoldTime(p.opened_at)}\n`;
         msg += `  <code>${p.mint}</code>\n\n`;
       }
@@ -379,14 +421,16 @@ class TelegramBot {
       const closed = await db.getUserClosedPositions(ctx.from.id, 15);
       if (!closed.length) return ctx.reply('No closed trades yet.');
       let msg = '<b>💰 History</b>\n\n';
-      let totalPnl = 0;
+      const totals = {};
       for (const p of closed) {
         const c = CHAINS[p.chain || 'solana'];
         const emoji = p.pnl_sol >= 0 ? '🟢' : '🔴';
-        msg += `${emoji} ${c?.emoji || ''} <b>${p.symbol || p.mint.slice(0, 6)}</b> ${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(0)}% | ${formatHoldTime(p.opened_at, p.closed_at)}\n`;
-        totalPnl += p.pnl_sol;
+        msg += `${emoji} ${c?.emoji || ''} <b>${esc(p.symbol || p.mint.slice(0, 6))}</b> ${p.pnl_pct >= 0 ? '+' : ''}${Number(p.pnl_pct).toFixed(0)}% | ${Number(p.pnl_sol).toFixed(4)} ${c?.currency || ''} | ${formatHoldTime(p.opened_at, p.closed_at)}\n`;
+        totals[p.chain || 'solana'] = (totals[p.chain || 'solana'] || 0) + Number(p.pnl_sol);
       }
-      msg += `\n<b>Total: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)}</b>`;
+      msg += '\n' + Object.entries(totals)
+        .map(([ch, v]) => `<b>Total ${CHAINS[ch]?.emoji || ''}: ${v >= 0 ? '+' : ''}${v.toFixed(4)} ${CHAINS[ch]?.currency || ''}</b>`)
+        .join('\n');
       ctx.replyWithHTML(msg);
     });
 
@@ -394,10 +438,18 @@ class TelegramBot {
       const stats = await db.getUserStats(ctx.from.id);
       if (!stats?.total_trades) return ctx.reply('No trades yet.');
       const wr = stats.total_trades > 0 ? (stats.winning_trades / stats.total_trades * 100) : 0;
+      const { rows } = await db.query(
+        `SELECT chain, SUM(pnl_sol)::float AS pnl FROM positions
+         WHERE user_id = $1 AND status = 'closed' GROUP BY chain`, [ctx.from.id]
+      );
+      const pnlLines = rows.map(r => {
+        const c = CHAINS[r.chain] || CHAINS.solana;
+        return `PnL ${c.emoji}: <b>${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(4)} ${c.currency}</b>`;
+      });
       ctx.replyWithHTML(
         `<b>📈 Stats</b>\n\n` +
         `Trades: <b>${stats.total_trades}</b> | WR: <b>${wr.toFixed(0)}%</b>\n` +
-        `PnL: <b>${stats.total_pnl_usd >= 0 ? '+' : ''}$${stats.total_pnl_usd.toFixed(2)}</b>\n` +
+        (pnlLines.length ? pnlLines.join('\n') + '\n' : '') +
         `Open: <b>${stats.open_positions}</b>`
       );
     });
@@ -591,7 +643,7 @@ class TelegramBot {
           ? m(t.initial_mc * t.peak_multiple) : '—';
         const date = t.detected_at ? new Date(t.detected_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
         lines.push(
-          `${i + 1}. ${se(t.score || 0)} <b>${t.symbol || 'UNKNOWN'}</b> [${Math.round(t.peak_multiple)}x] — Score ${t.score || '?'}\n` +
+          `${i + 1}. ${se(t.score || 0)} <b>${esc(t.symbol || 'UNKNOWN')}</b> [${Number(t.peak_multiple).toFixed(1)}x] — Score ${t.score ?? '?'}\n` +
           `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}${date ? `  ·  ${date}` : ''}\n` +
           `   <code>${t.mint}</code>`
         );
@@ -715,8 +767,8 @@ class TelegramBot {
       if (String(ctx.from.id) !== String(this.adminId)) return;
       const args = ctx.message.text.split(/\s+/).slice(1);
       if (!args.length) {
-        const solOn = process.env.SOLANA_SCANNER_ENABLED !== 'false';
-        const rhOn = process.env.ROBINHOOD_SCANNER_ENABLED !== 'false';
+        const solOn = this.scanner ? this.scanner.enabled.solana : true;
+        const rhOn = this.scanner ? this.scanner.enabled.robinhood : true;
         return ctx.replyWithHTML(
           `<b>🔗 Scanner Status</b>\n\n` +
           `◎ Solana: ${solOn ? '✅ Active' : '❌ Disabled'}\n` +
@@ -727,9 +779,26 @@ class TelegramBot {
       if (!['solana', 'robinhood'].includes(chain) || !['on', 'off'].includes(state)) {
         return ctx.reply('Usage: /scanchain <solana|robinhood> <on|off>');
       }
-      const envKey = chain === 'solana' ? 'SOLANA_SCANNER_ENABLED' : 'ROBINHOOD_SCANNER_ENABLED';
-      process.env[envKey] = state === 'on' ? 'true' : 'false';
-      ctx.reply(`${chain} scanner ${state === 'on' ? 'enabled' : 'disabled'} (resets on restart)`);
+      // This used to set an env var that nothing read after startup, so the
+      // toggle reported success and changed nothing.
+      if (!this.scanner) return ctx.reply('Scanner not attached.');
+      this.scanner.setEnabled(chain, state === 'on');
+      ctx.reply(`${chain} scanner ${state === 'on' ? 'enabled' : 'disabled'} (resets on restart — set ${chain.toUpperCase()}_SCANNER_ENABLED to persist)`);
+    });
+
+    this.bot.command('health', async (ctx) => {
+      if (String(ctx.from.id) !== String(this.adminId)) return;
+      if (!this.health) return ctx.reply('Health monitor not attached.');
+      await ctx.replyWithHTML(await this.health.status());
+    });
+
+    this.bot.command('setliq', async (ctx) => {
+      const v = parseFloat((ctx.message.text.split(' ')[1] || '').replace(/[$,k]/gi, m => (m.toLowerCase() === 'k' ? 'e3' : '')));
+      if (!Number.isFinite(v) || v < 0 || v > 10_000_000) {
+        return ctx.reply('Usage: /setliq <usd>  — e.g. /setliq 10000 or /setliq 10k (0 = no minimum)');
+      }
+      await db.updateUser(ctx.from.id, { alert_min_liq_usd: v });
+      ctx.reply(v ? `✅ Only alerting tokens with at least ${money(v)} liquidity` : '✅ Liquidity filter off');
     });
 
     // Catch-all for free text. Must stay registered AFTER every command:
@@ -863,7 +932,7 @@ class TelegramBot {
     });
 
     // === QUICK BUY ===
-    this.bot.action(/qbuy_(.+)_(.+)/, async (ctx) => {
+    this.bot.action(/^qbuy_([^_]+)_([^_]+)$/, async (ctx) => {
       const mint = ctx.match[1];
       const amountStr = ctx.match[2];
       if (amountStr === 'custom') {
@@ -875,7 +944,7 @@ class TelegramBot {
     });
 
     // === QUICK SELL ===
-    this.bot.action(/qsell_(.+)_(\d+)/, async (ctx) => {
+    this.bot.action(/^qsell_([^_]+)_(\d+)$/, async (ctx) => {
       const mint = ctx.match[1];
       const pct = parseInt(ctx.match[2]);
       await ctx.answerCbQuery(`Selling ${pct}%...`);
@@ -963,7 +1032,17 @@ class TelegramBot {
       }).catch(() => {});
     });
 
-    this.bot.action(/alertchain_(\w+)/, async (ctx) => {
+    this.bot.action(/^alertliq_(\d+)$/, async (ctx) => {
+      const v = parseInt(ctx.match[1], 10);
+      await db.updateUser(ctx.from.id, { alert_min_liq_usd: v });
+      await ctx.answerCbQuery(v ? `Min liquidity: ${money(v)}` : 'Liquidity filter off');
+      const fresh = await db.getUser(ctx.from.id);
+      await ctx.editMessageText(this._renderAlertSettings(fresh), {
+        parse_mode: 'HTML', ...this._alertButtons(fresh),
+      }).catch(() => {});
+    });
+
+    this.bot.action(/^alertchain_(solana|robinhood)$/, async (ctx) => {
       const chain = ctx.match[1];
       const user = await db.getUser(ctx.from.id);
       const current = new Set((user.alert_chains || 'solana,robinhood').split(',').filter(Boolean));
@@ -978,13 +1057,13 @@ class TelegramBot {
 
     // Buy straight from an alert. The chain rides in the callback data, so
     // there is no "switch chain first" step between seeing a call and taking it.
-    this.bot.action(/abuy_(\w+)_([^_]+)_([\d.]+)/, async (ctx) => {
+    this.bot.action(/^abuy_(solana|robinhood)_([^_]+)_([\d.]+)$/, async (ctx) => {
       const [, chain, mint, amountStr] = ctx.match;
       await ctx.answerCbQuery(`Buying ${amountStr} on ${CHAINS[chain]?.name || chain}...`);
       await this._executeBuy(ctx, mint, parseFloat(amountStr), chain);
     });
 
-    this.bot.action(/analyze_(\w+)_(.+)/, async (ctx) => {
+    this.bot.action(/^analyze_(solana|robinhood)_(.+)$/, async (ctx) => {
       await ctx.answerCbQuery();
       await this._sendAnalysis(ctx, ctx.match[2], ctx.match[1]);
     });
@@ -1029,10 +1108,10 @@ class TelegramBot {
       '',
       `Status: <b>${user.alerts_enabled ? 'ON' : 'OFF'}</b>`,
       `Min score: <b>${user.alert_min_score ?? 60}</b>/100`,
-      `Min liquidity: <b>${user.alert_min_liquidity ?? 5}</b> (native)`,
+      `Min liquidity: <b>${user.alert_min_liq_usd ? money(user.alert_min_liq_usd) : 'none'}</b>`,
       `Chains:\n  ${chainLabels}`,
       '',
-      `<i>Only tokens the thesis engine scores at or above your minimum are sent. Raise it for fewer, higher-conviction calls.</i>`,
+      `<i>60–74 = safe new launches with no trading yet. 75+ = only tokens that already show buying momentum. Raise it for fewer, higher-conviction calls.</i>`,
     ].join('\n');
   }
 
@@ -1041,7 +1120,13 @@ class TelegramBot {
     return Markup.inlineKeyboard([
       [Markup.button.callback(user.alerts_enabled ? '🔕 Turn OFF' : '🔔 Turn ON', 'alerts_toggle')],
       [40, 60, 75, 85].map(v =>
-        Markup.button.callback(`${score === v ? '•' : ''}${v}`, `alertscore_${v}`)
+        Markup.button.callback(`${score === v ? '• ' : ''}Score ${v}+`, `alertscore_${v}`)
+      ),
+      [0, 5000, 10000, 25000].map(v =>
+        Markup.button.callback(
+          `${(user.alert_min_liq_usd || 0) === v ? '• ' : ''}${v ? `Liq ${money(v)}+` : 'Any liq'}`,
+          `alertliq_${v}`
+        )
       ),
       Object.entries(CHAINS).map(([k, c]) =>
         Markup.button.callback(`${c.emoji} ${c.name}`, `alertchain_${k}`)
@@ -1058,12 +1143,14 @@ class TelegramBot {
     const msg = await ctx.reply('🔬 Analyzing...');
     try {
       const stored = await db.getToken(chain, mint);
-      const { token, analysis } = await this.analyzer.analyze({
-        chain, mint,
+      const { token, analysis } = await withTimeout(this.analyzer.analyze({
+        chain, mint: stored?.mint || mint,
         deployer: stored?.deployer,
-        liquidityNative: stored?.liquidity_sol,
-        symbol: stored?.symbol,
-      });
+        poolAddress: stored?.pool_address,
+        lpMint: stored?.lp_mint,
+        dex: stored?.dex,
+        symbol: stored?.symbol !== 'UNKNOWN' ? stored?.symbol : undefined,
+      }), 45000, 'analysis');
 
       await ctx.telegram.editMessageText(
         ctx.chat.id, msg.message_id, undefined,
@@ -1119,6 +1206,7 @@ class TelegramBot {
 
   async _executeSell(ctx, mint, pct) {
     try {
+      await ctx.reply(`⏳ Selling ${pct}%...`);
       const result = await this.engine.sellToken(ctx.from.id, mint, pct / 100);
       if (result.closed) {
         const emoji = result.pnlSol >= 0 ? '🟢' : '🔴';
@@ -1186,6 +1274,7 @@ class TelegramBot {
 
   hookTradeEvents() {
     this.engine.onTradeEvent = async (event) => {
+      if (event.type === 'sell_failed') return this._notifySellFailed(event);
       if (event.type !== 'close') return;
       try {
         const user = await db.getUser(event.userId);
@@ -1210,6 +1299,24 @@ class TelegramBot {
         logger.error(`Card send failed: ${err.message}`);
       }
     };
+  }
+
+  /**
+   * An automatic TP/SL sell that fails is retried every monitor cycle, so
+   * tell the user once an hour per position rather than every 30 seconds —
+   * but do tell them: a stop-loss that silently never fills costs money.
+   */
+  async _notifySellFailed(event) {
+    const key = `${event.position.id}:${event.reason}`;
+    const last = this._sellFailNotified.get(key) || 0;
+    if (Date.now() - last < 60 * 60 * 1000) return;
+    this._sellFailNotified.set(key, Date.now());
+    if (this._sellFailNotified.size > 5000) this._sellFailNotified.clear();
+    const sym = esc(event.position.symbol || event.position.mint.slice(0, 8));
+    await this.sendAlert(event.userId,
+      `⚠️ <b>${event.reason} sell failed</b> — ${sym}\n\n${esc(event.error).slice(0, 200)}\n\n` +
+      `<i>Retrying automatically. You can also sell manually:</i>`,
+      { reply_markup: this._sellButtons(event.position.mint).reply_markup });
   }
 
   async sendMonthlyCard(userId, ctx) {
@@ -1241,32 +1348,95 @@ class TelegramBot {
     });
   }
 
+  /** Send an HTML message. Resolves true when delivered, false otherwise. */
   async sendAlert(chatId, msg, extra = {}) {
-    try {
-      await this.bot.telegram.sendMessage(chatId, msg, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        ...extra,
-      });
-    } catch (e) {
-      // 403 means the user blocked the bot — stop alerting them rather than
-      // retrying forever on every launch.
-      if (e.response?.error_code === 403) {
-        await db.updateUser(chatId, { alerts_enabled: false }).catch(() => {});
-        logger.warn(`[alert] ${chatId} blocked the bot — alerts disabled`);
-      } else {
-        logger.error(`Alert failed for ${chatId}: ${e.message}`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await this.bot.telegram.sendMessage(chatId, msg, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...extra,
+        });
+        return true;
+      } catch (e) {
+        const code = e.response?.error_code;
+        // Flood control: Telegram says exactly how long to wait.
+        if (code === 429 && attempt === 0) {
+          await sleep(Math.min((e.response?.parameters?.retry_after || 3) * 1000, 30000));
+          continue;
+        }
+        // 403: the user blocked the bot. 400 "chat not found": the account is
+        // gone. Either way stop alerting them rather than failing forever.
+        if (code === 403 || (code === 400 && /chat not found/i.test(e.description || e.message))) {
+          await db.updateUser(chatId, { alerts_enabled: false }).catch(() => {});
+          logger.warn(`[alert] ${chatId} unreachable (${code}) — alerts disabled`);
+        } else {
+          logger.error(`Alert failed for ${chatId}: ${e.description || e.message}`);
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Start long polling under a supervisor.
+   *
+   * Telegraf ends polling permanently on a 409 Conflict (another process is
+   * polling with this token — routine for a few seconds during a redeploy)
+   * and on any unexpected getUpdates error. Previously that rejection went
+   * unobserved: alerts kept flowing out, but no command was ever answered
+   * again. Here polling is restarted with backoff until stop() is called.
+   */
+  async launch() {
+    this.bot.botInfo = await this._getMe();
+    logger.info(`Telegram bot authenticated as @${this.bot.botInfo.username}`);
+    this._poll(0);
+  }
+
+  async _getMe() {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await withTimeout(this.bot.telegram.getMe(), 15000, 'getMe');
+      } catch (err) {
+        if (err.response?.error_code === 401) throw new Error('TELEGRAM_BOT_TOKEN is invalid (401 Unauthorized)');
+        if (attempt >= 5) throw err;
+        logger.warn(`[bot] getMe failed (${err.message}), retrying`);
+        await sleep(2000 * (attempt + 1));
       }
     }
   }
 
-  async launch() {
-    this.bot.launch({ dropPendingUpdates: true });
-    // Wait briefly for botInfo to populate
-    await new Promise(r => setTimeout(r, 2000));
-    logger.info(`Telegram bot started as @${this.bot.botInfo?.username}`);
+  _poll(restarts) {
+    if (this._stopping) return;
+    const startedAt = Date.now();
+    this.bot.launch({ dropPendingUpdates: restarts === 0 })
+      .then(() => {
+        if (!this._stopping) {
+          logger.warn('[bot] polling ended unexpectedly — restarting');
+          setTimeout(() => this._poll(restarts + 1), 2000).unref?.();
+        }
+      })
+      .catch((err) => {
+        if (this._stopping) return;
+        const code = err.response?.error_code;
+        // A long healthy run resets the backoff.
+        const n = Date.now() - startedAt > 10 * 60 * 1000 ? 0 : restarts;
+        const delay = Math.min(5000 * 2 ** n, 120000);
+        if (code === 409) {
+          logger.warn(`[bot] 409 Conflict: another instance is polling this bot token. Retrying in ${delay / 1000}s ` +
+            '(normal for a few seconds during a redeploy; if it persists, a second copy of the bot is running).');
+        } else {
+          logger.error(`[bot] polling stopped: ${err.description || err.message}. Restarting in ${delay / 1000}s`);
+        }
+        setTimeout(() => this._poll(n + 1), delay).unref?.();
+      });
   }
-  stop() { this.bot.stop(); }
+
+  stop() {
+    this._stopping = true;
+    try { this.bot.stop('shutdown'); } catch { /* not running */ }
+  }
 }
 
 module.exports = TelegramBot;

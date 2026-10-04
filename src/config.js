@@ -68,9 +68,12 @@ const config = {
   },
 
   alerts: {
-    // Only tokens scoring at or above this are pushed to subscribers.
+    // Default per-user minimum score (users change theirs with /setscore).
     minScore: int('ALERT_MIN_SCORE', 60),
-    minLiquidityNative: num('ALERT_MIN_LIQUIDITY', 5),
+    // Absolute floor: nothing below this is sent to anyone, whatever their
+    // own setting. Used to be minScore itself, which made the 40 option in
+    // /alerts a button that did nothing.
+    floor: int('ALERT_FLOOR', 40),
     // Hard ceiling on alerts per minute across all users, protects the bot
     // from a spam-launch wave burning the Telegram rate limit.
     maxPerMinute: int('ALERT_MAX_PER_MINUTE', 10),
@@ -83,6 +86,25 @@ const config = {
   },
 
   positionCheckIntervalSec: int('POSITION_CHECK_INTERVAL', 30),
+
+  scanner: {
+    solana: bool('SOLANA_SCANNER_ENABLED', true),
+    robinhood: bool('ROBINHOOD_SCANNER_ENABLED', true),
+    // Skip pools seeded with less SOL than this — dust pools are noise and
+    // each one costs RPC calls to analyse.
+    minLiquiditySol: num('SCAN_MIN_LIQUIDITY_SOL', 1),
+  },
+
+  // Minutes after detection at which each plausible token is analysed again.
+  // At t=0 nothing has traded yet; these are when momentum becomes visible.
+  recheck: {
+    delaysMin: (process.env.RECHECK_DELAYS_MIN || '3,10')
+      .split(',').map(Number).filter(n => Number.isFinite(n) && n > 0),
+  },
+
+  pipeline: {
+    concurrency: int('ANALYZE_CONCURRENCY', 4),
+  },
 
   health: {
     // Warn the admin when a chain has produced no pools for this long. A quiet

@@ -12,6 +12,13 @@ const TradeEngine = require('../src/engine/tradeEngine');
 const Alerter = require('../src/services/alerter');
 const Tracker = require('../src/services/tracker');
 const Scorer = require('../src/analysis/scorer');
+const Pipeline = require('../src/services/pipeline');
+const Scanner = require('../src/services/scanner');
+const solanaPools = require('../src/services/solanaPools');
+const { isProgramOwned } = require('../src/analysis/safety');
+const { poolFeePct } = require('../src/services/swap/evmSwap');
+const { WorkQueue, singleFlight, sleep } = require('../src/utils/async');
+const fixtures = require('./fixtures/pumpswap_logs.json');
 
 let pass = 0, fail = 0, group = '';
 const section = (n) => { group = n; console.log(`\n${n}`); };
@@ -196,7 +203,7 @@ async function alerts() {
   const sent = [];
   const bot = { sendAlert: async (id, txt, extra) => sent.push({ id: Number(id), txt, extra }) };
   const config = {
-    alerts: { minScore: 60, minLiquidityNative: 5, maxPerMinute: 3 },
+    alerts: { minScore: 60, floor: 40, maxPerMinute: 3 },
     tracker: { enabled: true, snapshotIntervalSec: 120, trackHours: 24 },
   };
   const alerter = new Alerter({ db, bot, config });
@@ -206,8 +213,8 @@ async function alerts() {
   await db.query('UPDATE users SET alerts_enabled = FALSE');
   for (const id of [201, 202, 203]) await db.getOrCreateUser(id, `u${id}`);
   await db.query('UPDATE users SET alerts_enabled = TRUE WHERE telegram_id IN (201, 202)');
-  await db.updateUser(201, { alert_min_score: 60, alert_min_liquidity: 0 });
-  await db.updateUser(202, { alert_min_score: 85, alert_min_liquidity: 0 });
+  await db.updateUser(201, { alert_min_score: 60, alert_min_liq_usd: 0 });
+  await db.updateUser(202, { alert_min_score: 85, alert_min_liq_usd: 0 });
   await db.updateUser(203, { alerts_enabled: false });
 
   const token = (mint, extra = {}) => ({
@@ -256,18 +263,18 @@ async function alerts() {
       throw new Error('smart money was rate limited');
     }
   });
-  // User 201 requires 5 native liquidity; 202 requires none. Assert on 201.
+  // User 201 requires $5k liquidity; 202 requires none. Assert on 201.
   await t('unmeasured liquidity does not filter a user out', async () => {
-    await db.updateUser(201, { alert_min_liquidity: 5, alert_chains: 'solana,robinhood' });
+    await db.updateUser(201, { alert_min_liq_usd: 5000, alert_chains: 'solana,robinhood' });
     const subs = await db.getAlertSubscribers('robinhood', 90, null);
     if (!subs.some(s => Number(s.telegram_id) === 201)) {
       throw new Error('a token with unknown liquidity was withheld from a subscriber');
     }
   });
   await t('measured-but-thin liquidity does filter out', async () => {
-    const subs = await db.getAlertSubscribers('solana', 90, 1);
+    const subs = await db.getAlertSubscribers('solana', 90, 1000);
     if (subs.some(s => Number(s.telegram_id) === 201)) {
-      throw new Error('1 native liquidity should be below the subscriber minimum of 5');
+      throw new Error('$1k liquidity should be below the subscriber minimum of $5k');
     }
   });
 }
@@ -363,6 +370,252 @@ async function smartMoney() {
   });
 }
 
+async function detection() {
+  section('Pool detection (live-captured PumpSwap logs)');
+  await t('a CreatePool log is recognised; ordinary swaps are not', async () => {
+    for (const c of fixtures.creates) if (!solanaPools.isPumpSwapCreate(c.logs)) throw new Error(`missed ${c.signature}`);
+    for (const sw of fixtures.swaps) {
+      if (solanaPools.isPumpSwapCreate(sw.logs)) throw new Error(`swap ${sw.signature} matched as a pool creation`);
+    }
+  });
+  await t('CreatePoolEvent decodes to the same pool the chain stored', async () => {
+    for (const c of fixtures.creates) {
+      const d = solanaPools.decodePumpSwapCreate(c.logs);
+      const tokenSide = c.poolAcct.base === solanaPools.WSOL ? c.poolAcct.quote : c.poolAcct.base;
+      eq(d.mint, tokenSide, 'mint');
+      eq(d.deployer, c.poolAcct.creator, 'deployer');
+      if (!(d.liquiditySol > 1)) throw new Error(`liquidity ${d.liquiditySol}`);
+      if (!d.lpMint) throw new Error('no lp mint');
+      if (!(d.priceNative > 0 && d.priceNative < 1)) throw new Error(`price ${d.priceNative}`);
+    }
+  });
+  await t('hand-made pools with no coin_creator are not marked as graduations', async () => {
+    for (const c of fixtures.creates) eq(solanaPools.decodePumpSwapCreate(c.logs).graduated, false, 'graduated');
+  });
+  await t('the scanner emits the decoded token and ignores swaps', async () => {
+    const emitted = [];
+    const sc = new Scanner({
+      connection: {}, swapRouter: {}, db: { getToken: async () => null, recordDeployerLaunch: async () => {} },
+    });
+    sc.onNewToken = async (tok) => emitted.push(tok);
+    for (const sw of fixtures.swaps) sc._onPumpSwapLogs(sw);
+    sc._onPumpSwapLogs(fixtures.creates[0]);
+    await sleep(20);
+    eq(emitted.length, 1, 'emitted');
+    eq(emitted[0].mint, fixtures.creates[0].decoded.mint, 'mint');
+    eq(emitted[0].dex, 'pumpswap-direct', 'dex');
+  });
+  await t('a disabled chain emits nothing', async () => {
+    const emitted = [];
+    const sc = new Scanner({ connection: {}, swapRouter: {}, db: { getToken: async () => null, recordDeployerLaunch: async () => {} } });
+    sc.onNewToken = async (tok) => emitted.push(tok);
+    sc.setEnabled('solana', false);
+    sc._onPumpSwapLogs(fixtures.creates[1]);
+    await sleep(20);
+    eq(emitted.length, 0, 'emitted');
+  });
+  await t('a token already known for a while is not re-announced as new', async () => {
+    const emitted = [];
+    const old = { detected_at: new Date(Date.now() - 3600e3) };
+    const sc = new Scanner({ connection: {}, swapRouter: {}, db: { getToken: async () => old, recordDeployerLaunch: async () => {} } });
+    sc.onNewToken = async (tok) => emitted.push(tok);
+    sc._onPumpSwapLogs(fixtures.creates[2]);
+    await sleep(20);
+    eq(emitted.length, 0, 'emitted');
+  });
+  await t('pool vaults (PDAs) are program-owned; wallets are not', async () => {
+    eq(isProgramOwned(fixtures.creates[0].decoded.pool), true, 'pool PDA');
+    eq(isProgramOwned(fixtures.creates[0].decoded.deployer), false, 'creator wallet');
+  });
+  await t('a V4 dynamic-fee pool is not read as an 838% fee', async () => {
+    eq(poolFeePct(8388608), 'null', 'dynamic');
+    eq(poolFeePct(810000), 81, 'static');
+  });
+}
+
+async function calibration() {
+  section('Scoring calibration');
+  const scorer = new Scorer(db);
+  const base = {
+    chain: 'solana', mint: 'C',
+    safety: { mintAuthorityRevoked: true, freezeAuthorityRevoked: true, topHolderPct: 20, devHoldingPct: 3, honeypot: false, sellTaxPct: 2, flags: [] },
+    market: { liquidityUsd: 80000, marketCap: 300000, buys5m: 60, sells5m: 15, socials: { twitter: 'x' }, boosts: 0 },
+    liquidityNative: 100, nativePriceUsd: 150,
+  };
+  await t('unlocked LP caps an otherwise excellent token below the default bar', async () => {
+    const r = await scorer.score({ ...base, safety: { ...base.safety, lpUnlockedPct: 100 } });
+    if (r.score > Scorer.UNLOCKED_LP_CAP) throw new Error(`score ${r.score}`);
+    if (!/LP not locked/.test(r.bears[0])) throw new Error(r.bears[0]);
+  });
+  await t('unverifiable LP custody holds a token just under 60', async () => {
+    const r = await scorer.score({ ...base, safety: { ...base.safety, lpUnverified: true } });
+    if (r.score >= 60) throw new Error(`score ${r.score}`);
+  });
+  await t('without a single trade a token cannot be STRONG', async () => {
+    const r = await scorer.score({ ...base, market: { marketCap: 300000 } });
+    if (r.score > Scorer.NO_MOMENTUM_CAP) throw new Error(`score ${r.score}`);
+    if (!/EARLY/.test(r.verdict)) throw new Error(r.verdict);
+  });
+  await t('with real buying the same token can be', async () => {
+    const r = await scorer.score(base);
+    if (r.score < 75) throw new Error(`score ${r.score}`);
+  });
+  await t('a permanent-delegate Token-2022 mint is rejected outright', async () => {
+    const r = await scorer.score({ ...base, safety: { ...base.safety, fatal: 'permanent delegate' } });
+    eq(r.score, 0, 'score');
+  });
+  await t('concurrent scoring never applies one deployer\'s history to another token', async () => {
+    await db.recordDeployerLaunch('solana', 'RUGGER2');
+    for (let i = 0; i < 4; i++) await db.recordDeployerOutcome('solana', 'RUGGER2', 'rug', 0.1);
+    const [a, b] = await Promise.all([
+      scorer.score({ ...base, deployer: 'RUGGER2' }),
+      scorer.score({ ...base, deployer: 'CLEAN_NEW_DEV' }),
+    ]);
+    if (b.bears.some(x => /rugger|rugged/i.test(x))) throw new Error(`clean dev penalised: ${b.bears}`);
+    if (a.score >= b.score) throw new Error(`${a.score} >= ${b.score}`);
+  });
+}
+
+async function pipelineAndAlerts() {
+  section('Pipeline, re-checks and alert policy');
+  const sent = [];
+  const bot = { sendAlert: async (id, txt) => { sent.push({ id: Number(id), txt }); return true; } };
+  const config = { alerts: { minScore: 60, floor: 40, maxPerMinute: 100 }, recheck: { delaysMin: [0.001, 0.002] } };
+  const alerter = new Alerter({ db, bot, config });
+  await db.query('UPDATE users SET alerts_enabled = FALSE');
+  await db.getOrCreateUser(301, 'low'); await db.getOrCreateUser(302, 'high');
+  await db.query(`UPDATE users SET alerts_enabled = TRUE, alert_min_liq_usd = 0, alert_chains = 'solana,robinhood' WHERE telegram_id IN (301, 302)`);
+  await db.updateUser(301, { alert_min_score: 40 });
+  await db.updateUser(302, { alert_min_score: 80 });
+  const tok = (mint, symbol) => ({ chain: 'solana', mint, symbol, liquidityUsd: 30000, market: {}, watcherBuys: 0 });
+  const an = (score, extra = {}) => ({ score, confidence: 0.8, verdict: 'X', bulls: [], bears: [], categories: {}, ...extra });
+
+  await t('a user who chose 40 receives a 45 (the floor no longer overrides them)', async () => {
+    sent.length = 0;
+    await alerter.dispatchNewToken(tok('P45', 'FORTY5'), an(45));
+    eq(sent.map(x => x.id).join(), '301', 'recipients');
+  });
+  await t('a copycat ticker within 30 minutes is suppressed', async () => {
+    sent.length = 0;
+    await alerter.dispatchNewToken(tok('P46', 'forty5'), an(70));
+    eq(sent.length, 0, 'sent');
+  });
+  await t('a re-check with strong momentum sends one follow-up to those already told', async () => {
+    sent.length = 0;
+    const strong = an(85, { hasMomentum: true, categories: { momentum: 80 } });
+    await alerter.dispatchNewToken(tok('P45', 'FORTY5'), strong, { stage: 'recheck', ageMin: 3 });
+    const forLow = sent.filter(x => x.id === 301);
+    const forHigh = sent.filter(x => x.id === 302);
+    eq(forLow.length, 1, 'follow-ups to 301');
+    if (!/MOMENTUM/.test(forLow[0].txt)) throw new Error('not a momentum alert');
+    eq(forHigh.length, 1, 'late qualifier to 302');
+    if (!/NOW QUALIFYING/.test(forHigh[0].txt)) throw new Error('not a late-qualifier alert');
+    sent.length = 0;
+    await alerter.dispatchNewToken(tok('P45', 'FORTY5'), strong, { stage: 'recheck', ageMin: 10 });
+    eq(sent.length, 0, 'third message');
+  });
+
+  await t('the pipeline re-analyses a plausible token and alerts when it qualifies later', async () => {
+    sent.length = 0;
+    let calls = 0;
+    const analyzer = {
+      analyze: async (raw) => {
+        calls++;
+        const score = calls === 1 ? 50 : 82;
+        return {
+          token: { ...tok(raw.mint, 'LATE1'), score, honeypot: false },
+          analysis: an(score, { hasMomentum: calls > 1, categories: { momentum: calls > 1 ? 70 : 0 } }),
+        };
+      },
+    };
+    const pipe = new Pipeline({ analyzer, db, alerter, tracker: { trackingDeadline: () => new Date(Date.now() + 3600e3) }, config });
+    pipe.onDetected({ chain: 'solana', mint: 'LATEMINT' });
+    await sleep(2600);
+    pipe.stop();
+    if (calls < 2) throw new Error(`analysed ${calls}x`);
+    if (!sent.some(x => x.id === 302)) throw new Error('high-bar user never alerted after momentum arrived');
+  });
+  await t('hard-rejected tokens are not re-checked', async () => {
+    let calls = 0;
+    const analyzer = { analyze: async (raw) => { calls++; return { token: { ...tok(raw.mint, 'REJ'), honeypot: true }, analysis: an(0, { rejected: true }) }; } };
+    const pipe = new Pipeline({ analyzer, db, alerter, tracker: null, config });
+    pipe.onDetected({ chain: 'solana', mint: 'REJMINT' });
+    await sleep(1500);
+    pipe.stop();
+    eq(calls, 1, 'analyses');
+  });
+  await t('a lower-scoring re-check does not stop tracking or rewrite first market cap', async () => {
+    const until = new Date(Date.now() + 3600e3);
+    await db.saveToken({ chain: 'solana', mint: 'TRK', symbol: 'TRK', initialMc: 1000, score: 80, trackingUntil: until });
+    await db.saveToken({ chain: 'solana', mint: 'TRK', symbol: 'UNKNOWN', initialMc: 9000, score: 30, trackingUntil: null });
+    const row = await db.getToken('solana', 'TRK');
+    if (!row.tracking_until) throw new Error('tracking cleared');
+    eq(row.initial_mc, 1000, 'initial mc');
+    eq(row.symbol, 'TRK', 'symbol');
+  });
+  await t('EVM token lookups ignore address case', async () => {
+    await db.saveToken({ chain: 'robinhood', mint: '0xAbCdEf0000000000000000000000000000000001', symbol: 'CASE', poolKey: { fee: 1 } });
+    const row = await db.getToken('robinhood', '0xabcdef0000000000000000000000000000000001');
+    eq(row?.symbol, 'CASE', 'symbol');
+  });
+}
+
+async function robustness() {
+  section('Robustness');
+  await t('a full work queue rejects the newest job instead of evicting real work', async () => {
+    const q = new WorkQueue({ concurrency: 1, maxSize: 2 });
+    const done = [];
+    q.push(async () => { await sleep(30); done.push('a'); });
+    q.push(async () => done.push('b'));
+    q.push(async () => done.push('c'));
+    eq(q.push(async () => done.push('d')), false, 'accepted overflow');
+    await q.idle();
+    eq(done.join(''), 'abc', 'order');
+  });
+  await t('overlapping single-flight calls run once', async () => {
+    let n = 0;
+    const f = singleFlight(async () => { n++; await sleep(30); });
+    await Promise.all([f(), f(), f()]);
+    eq(n, 1, 'runs');
+  });
+  await t('a failed TP sell does not consume the TP level', async () => {
+    const state = { sells: [], priceUsd: 150 };
+    const swap = mockSwap(state);
+    const engine = new TradeEngine({ swapRouter: swap, walletManager: mockWallets, config: tradingConfig });
+    await db.getOrCreateUser(401, 'tpfail');
+    await db.updateUser(401, { sol_wallet_address: 'A', sol_wallet_key_encrypted: 'e', auto_sell: true });
+    await engine.buyToken(401, 'TPFAIL', 1, 'solana');
+    swap.sell = async () => { throw new Error('slippage exceeded'); };
+    state.priceUsd = 150 * 2.5;
+    await engine.checkAllPositions();
+    let p = (await db.getUserPositions(401, 'open')).find(x => x.mint === 'TPFAIL');
+    if (p.tp1_hit) throw new Error('TP1 marked hit although the sell failed');
+    swap.sell = mockSwap(state).sell;
+    await engine.checkAllPositions();
+    p = (await db.getUserPositions(401, 'open')).find(x => x.mint === 'TPFAIL');
+    if (!p.tp1_hit) throw new Error('TP1 not retried after recovery');
+  });
+  await t('a throwing Telegram handler cannot stop the bot (no rethrow into polling)', async () => {
+    const TelegramBot = require('../src/bot/telegramBot');
+    const tb = new TelegramBot({
+      tradeEngine: { onTradeEvent: null }, walletManager: {}, swapRouter: {}, analyzer: {}, tracker: {},
+      config: { telegram: { token: '123:ABC', adminId: null }, trading: { platformFeePct: 1 } },
+    });
+    tb.bot.botInfo = { username: 'testbot', id: 1 };
+    tb.bot.telegram.callApi = async () => ({ message_id: 1 });
+    let handled = null;
+    tb._handleError = (err) => { handled = err.message; };
+    tb.bot.command('boom', () => { throw new Error('kaboom'); });
+    const update = { update_id: 1, message: { message_id: 1, date: 0, chat: { id: 501, type: 'private' }, from: { id: 501, is_bot: false, first_name: 'x' }, text: '/boom', entities: [{ type: 'bot_command', offset: 0, length: 5 }] } };
+    // The catch-all text handler passes unmatched text on with next(), so
+    // /boom reaches the throwing command. handleUpdate must still resolve —
+    // a rejection here is what used to end Telegraf's polling loop.
+    await tb.bot.handleUpdate(update);
+    for (let i = 0; i < 50 && handled === null; i++) await sleep(20);
+    eq(handled, 'kaboom', 'error routed to the handler');
+  });
+}
+
 (async () => {
   await db.init();
   await positionAccounting();
@@ -370,6 +623,10 @@ async function smartMoney() {
   await alerts();
   await trackingAndScoring();
   await smartMoney();
+  await detection();
+  await calibration();
+  await pipelineAndAlerts();
+  await robustness();
   console.log(`\n${pass} passed, ${fail} failed`);
   await db.pool.end();
   process.exit(fail ? 1 : 0);

@@ -1,7 +1,16 @@
 const { Pool } = require('pg');
 const logger = require('../utils/logger');
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: parseInt(process.env.DB_POOL_MAX, 10) || 10,
+  // A query that cannot get a connection should fail, not hang the caller.
+  connectionTimeoutMillis: 10_000,
+  idleTimeoutMillis: 30_000,
+});
+// An idle client dropped by the server (managed Postgres restarts, network
+// blips) emits 'error' on the pool; unhandled, that kills the process.
+pool.on('error', (err) => logger.error(`[db] idle client error: ${err.message}`));
 
 async function init() {
   const client = await pool.connect();
@@ -119,6 +128,10 @@ async function migrate(client) {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS alert_min_score INTEGER DEFAULT 60;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS alert_min_liquidity DOUBLE PRECISION DEFAULT 5;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS alert_chains TEXT DEFAULT 'solana,robinhood';
+    -- Liquidity floor in USD. The old alert_min_liquidity was in "native"
+    -- units, so its default of 5 meant ~$1k on Solana but ~$12k on Robinhood,
+    -- silently dropping most Robinhood launches for every user.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS alert_min_liq_usd DOUBLE PRECISION DEFAULT 0;
   `);
 
   // --- positions: the old UNIQUE(user_id, mint, status) made it impossible to
@@ -161,12 +174,18 @@ async function migrate(client) {
     -- The exact Uniswap V4 PoolKey seen in the Initialize event. Fee and
     -- tickSpacing vary per pool, so quotes are impossible without it.
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS pool_key JSONB;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS lp_mint TEXT;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS lp_unlocked_pct DOUBLE PRECISION;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS liquidity_usd DOUBLE PRECISION;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS sell_tax_pct DOUBLE PRECISION;
   `);
 
   // The old tokens table had UNIQUE(mint) only. Two chains can theoretically
   // collide, so widen it to (chain, mint).
   await client.query(`ALTER TABLE tokens DROP CONSTRAINT IF EXISTS tokens_mint_key`);
   await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_chain_mint ON tokens(chain, mint)`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_tokens_tracking ON tokens(tracking_until) WHERE tracking_until IS NOT NULL`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_tokens_lower_mint ON tokens(chain, lower(mint))`);
 
   // --- Phase 5: on-chain tracking + analytics ---
   await client.query(`
@@ -276,16 +295,17 @@ async function updateUser(telegramId, updates) {
 }
 
 // Users who should receive an alert for this token, per their own filters.
-async function getAlertSubscribers(chain, score, liquidityNative) {
+// Liquidity is in USD so one threshold means the same thing on every chain.
+async function getAlertSubscribers(chain, score, liquidityUsd) {
   const { rows } = await pool.query(
     `SELECT telegram_id, alert_min_score FROM users
      WHERE is_active = TRUE
        AND alerts_enabled = TRUE
        AND COALESCE(alert_min_score, 60) <= $2::int
-       AND ($3::double precision IS NULL OR COALESCE(alert_min_liquidity, 0) <= $3::double precision)
-       AND COALESCE(alert_chains, 'solana,robinhood') LIKE '%' || $1 || '%'`,
+       AND ($3::double precision IS NULL OR COALESCE(alert_min_liq_usd, 0) <= $3::double precision)
+       AND (',' || COALESCE(alert_chains, 'solana,robinhood') || ',') LIKE '%,' || $1 || ',%'`,
     // null liquidity means "unmeasured", not "zero" — do not filter on it.
-    [chain, score, liquidityNative ?? null]
+    [chain, score, liquidityUsd ?? null]
   );
   return rows;
 }
@@ -299,13 +319,17 @@ async function saveToken(token) {
        chain, mint, symbol, name, deployer, pool_address, dex, liquidity_sol, initial_mc,
        lp_locked, mint_authority_revoked, freeze_authority_revoked, top_holder_pct, is_safe,
        decimals, total_supply, holder_count, dev_holding_pct, lp_burned_pct, honeypot,
-       score, score_breakdown, thesis, socials, tracking_until, pool_key)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+       score, score_breakdown, thesis, socials, tracking_until, pool_key,
+       lp_mint, lp_unlocked_pct, liquidity_usd, sell_tax_pct)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
      ON CONFLICT (chain, mint) DO UPDATE SET
-       symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
+       symbol = CASE WHEN EXCLUDED.symbol IS NULL OR EXCLUDED.symbol = 'UNKNOWN'
+                     THEN tokens.symbol ELSE EXCLUDED.symbol END,
        name = COALESCE(EXCLUDED.name, tokens.name),
-       liquidity_sol = EXCLUDED.liquidity_sol,
-       initial_mc = EXCLUDED.initial_mc,
+       deployer = COALESCE(tokens.deployer, EXCLUDED.deployer),
+       liquidity_sol = COALESCE(EXCLUDED.liquidity_sol, tokens.liquidity_sol),
+       -- The market cap at FIRST sighting is what the leaderboard measures from.
+       initial_mc = COALESCE(tokens.initial_mc, EXCLUDED.initial_mc),
        lp_locked = EXCLUDED.lp_locked,
        mint_authority_revoked = EXCLUDED.mint_authority_revoked,
        freeze_authority_revoked = EXCLUDED.freeze_authority_revoked,
@@ -320,9 +344,15 @@ async function saveToken(token) {
        score = EXCLUDED.score,
        score_breakdown = EXCLUDED.score_breakdown,
        thesis = EXCLUDED.thesis,
-       socials = EXCLUDED.socials,
-       tracking_until = EXCLUDED.tracking_until,
-       pool_key = COALESCE(EXCLUDED.pool_key, tokens.pool_key)
+       socials = COALESCE(EXCLUDED.socials, tokens.socials),
+       -- A re-check that scores lower must not stop tracking a token that
+       -- was already alerted; only ever extend the window.
+       tracking_until = GREATEST(tokens.tracking_until, EXCLUDED.tracking_until),
+       pool_key = COALESCE(EXCLUDED.pool_key, tokens.pool_key),
+       lp_mint = COALESCE(EXCLUDED.lp_mint, tokens.lp_mint),
+       lp_unlocked_pct = COALESCE(EXCLUDED.lp_unlocked_pct, tokens.lp_unlocked_pct),
+       liquidity_usd = COALESCE(EXCLUDED.liquidity_usd, tokens.liquidity_usd),
+       sell_tax_pct = COALESCE(EXCLUDED.sell_tax_pct, tokens.sell_tax_pct)
      RETURNING *`,
     [chain, token.mint, token.symbol, token.name, token.deployer, token.poolAddress,
      token.dex || 'raydium', token.liquiditySol, token.initialMc,
@@ -332,13 +362,19 @@ async function saveToken(token) {
      token.score, token.scoreBreakdown ? JSON.stringify(token.scoreBreakdown) : null,
      token.thesis, token.socials ? JSON.stringify(token.socials) : null,
      token.trackingUntil || null,
-     token.poolKey ? JSON.stringify(token.poolKey) : null]
+     token.poolKey ? JSON.stringify(token.poolKey) : null,
+     token.lpMint || null, token.lpUnlockedPct ?? null,
+     token.liquidityUsd ?? null, token.sellTaxPct ?? null]
   );
   return rows[0];
 }
 
+// EVM addresses are case-insensitive (checksummed vs lowercase are the same
+// token); Solana base58 is case-sensitive and must match exactly.
 async function getToken(chain, mint) {
-  const { rows } = await pool.query(`SELECT * FROM tokens WHERE chain=$1 AND mint=$2`, [chain, mint]);
+  const { rows } = chain === 'solana'
+    ? await pool.query(`SELECT * FROM tokens WHERE chain=$1 AND mint=$2`, [chain, mint])
+    : await pool.query(`SELECT * FROM tokens WHERE chain=$1 AND lower(mint)=lower($2) LIMIT 1`, [chain, mint]);
   return rows[0];
 }
 

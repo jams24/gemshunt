@@ -1,44 +1,62 @@
 const { PublicKey } = require('@solana/web3.js');
 const logger = require('../utils/logger');
+const stats = require('./stats');
+const { WorkQueue, settle } = require('../utils/async');
+const {
+  PROGRAMS, isPumpSwapCreate, isRaydiumInit, decodePumpSwapCreate, extractRaydiumPool,
+  decodePumpSwapPoolAccount, findPumpSwapPoolInTx,
+} = require('./solanaPools');
 
-const RAYDIUM_AMM_V4 = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
-const PUMPSWAP_AMM = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
-const PUMP_FUN = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-const WSOL = 'So11111111111111111111111111111111111111112';
-const SEEN_MAX = 5000;
-const QUEUE_MAX = 30;
-const JOB_COOLDOWN_MS = 2000;
+const SEEN_MAX = 20000;
+// PumpSwap alone emits hundreds of log notifications a second. A socket that
+// has delivered NOTHING for this long is dead, not quiet — the old watchdog
+// waited 15 minutes for a *pool* before it would reconnect.
+const SOLANA_STALE_MS = 90 * 1000;
+const WATCHDOG_EVERY_MS = 30 * 1000;
 
+/**
+ * Watches every chain for new pools and emits one uniform event per token:
+ *   { chain, mint, deployer, poolAddress, dex, liquidityNative, poolKey?, decimals? }
+ *
+ * Detection is deliberately cheap. On Solana the PumpSwap pool is decoded out
+ * of the log notification itself — no RPC call at all — and only rare Raydium
+ * launches cost a getParsedTransaction. Everything expensive happens later, in
+ * the analyzer, once per real token.
+ */
 class Scanner {
-  constructor({ connection, swapRouter, db }) {
+  constructor({ connection, connectionFactory, swapRouter, db, config = {} }) {
     this.connection = connection;
+    // A dead websocket is replaced with a fresh Connection rather than
+    // re-subscribed on the old one, which can hold a half-open socket.
+    this.connectionFactory = connectionFactory || (() => connection);
     this.swap = swapRouter;
     this.db = db;
+    this.config = config;
     this.onNewToken = null;
+
+    this.enabled = {
+      solana: config.scanner?.solana ?? true,
+      robinhood: config.scanner?.robinhood ?? true,
+    };
+    this.minLiquiditySol = config.scanner?.minLiquiditySol ?? 0;
+
     this.seen = new Set();
     this.subscriptions = [];
-    this._queue = [];
-    this._draining = false;
+    this.lastActivity = { solana: 0, robinhood: 0 };
+    this.reconnects = { solana: 0 };
+
+    this.txQueue = new WorkQueue({
+      concurrency: 2,
+      maxSize: 200,
+      label: 'scan-tx',
+      onError: err => logger.error(`[scan] tx job: ${err.message}`),
+    });
   }
 
-  _enqueue(fn) {
-    if (this._queue.length >= QUEUE_MAX) {
-      this._queue.shift();
-    }
-    this._queue.push(fn);
-    if (!this._draining) this._drain();
-  }
-
-  async _drain() {
-    this._draining = true;
-    while (this._queue.length) {
-      const job = this._queue.shift();
-      try { await job(); } catch {}
-      if (this._queue.length) {
-        await new Promise(r => setTimeout(r, JOB_COOLDOWN_MS));
-      }
-    }
-    this._draining = false;
+  setEnabled(chain, on) {
+    if (!(chain in this.enabled)) throw new Error(`Unknown chain ${chain}`);
+    this.enabled[chain] = on;
+    logger.info(`[scan] ${chain} scanner ${on ? 'enabled' : 'disabled'}`);
   }
 
   _markSeen(key) {
@@ -48,239 +66,216 @@ class Scanner {
     return true;
   }
 
+  /**
+   * Hand a detected pool to the pipeline. A token we already know is not a
+   * new launch — a second pool for an existing coin is common and is not
+   * worth an alert.
+   */
   async _emit(token) {
+    if (!this.enabled[token.chain]) return;
+    if (!this._markSeen(`${token.chain}:mint:${token.mint.toLowerCase()}`)) return;
+
+    stats.inc(token.chain, 'detected');
     try {
-      if (token.chain === 'solana') this._lastSolanaPool = Date.now();
-      await this.db.recordDeployerLaunch(token.chain, token.deployer);
+      const known = await settle(this.db.getToken(token.chain, token.mint), 3000, null);
+      if (known && Date.now() - new Date(known.detected_at).getTime() > 10 * 60 * 1000) {
+        stats.inc(token.chain, 'skipped_known_token');
+        return;
+      }
+      await settle(this.db.recordDeployerLaunch(token.chain, token.deployer), 3000);
       if (this.onNewToken) await this.onNewToken(token);
     } catch (err) {
-      logger.error(`[scan] emit failed for ${token.mint}: ${err.message}`);
+      logger.error(`[scan] emit failed for ${token.chain}/${token.mint}: ${err.message}`);
     }
   }
 
   async start() {
-    await this._startSolana();
+    this._startSolana();
     this._startRobinhood();
-    this._startWatchdog();
-  }
-
-  _startWatchdog() {
-    const CHECK_MS = 5 * 60 * 1000;
-    const STALE_MS = 15 * 60 * 1000;
-    this._reconnectAttempts = 0;
-    this._watchdog = setInterval(async () => {
-      const last = this._lastSolanaPool || this._startedAt || Date.now();
-      const quiet = Date.now() - last;
-      if (quiet < STALE_MS) return;
-
-      this._reconnectAttempts++;
-      const backoff = Math.min(this._reconnectAttempts * 5, 30);
-      logger.warn(`[scan] Solana silent for ${Math.round(quiet / 60000)}m — reconnecting (attempt ${this._reconnectAttempts}, next check in ${backoff}m)`);
-
-      try {
-        for (const unsub of this.subscriptions) {
-          try { unsub(); } catch {}
-        }
-        this.subscriptions = [];
-        await new Promise(r => setTimeout(r, backoff * 1000));
-        await this._startSolana();
-        this._lastSolanaPool = Date.now();
-        this._reconnectAttempts = 0;
-        logger.info('[scan] Solana WebSocket reconnected');
-      } catch (err) {
-        logger.error(`[scan] reconnect failed: ${err.message}`);
-      }
-    }, CHECK_MS);
+    this._watchdog = setInterval(() => this._checkLiveness(), WATCHDOG_EVERY_MS);
     this._watchdog.unref?.();
-    this._startedAt = Date.now();
   }
 
   // ------------------------------------------------------------- Solana
 
-  async _startSolana() {
-    // PumpSwap — where 95%+ of new tokens launch (Pump.fun graduates here since March 2025)
-    // Pool creations have Initialize + CreateIdempotent logs and 10+ inner instructions
-    const pumpSwapId = this.connection.onLogs(PUMPSWAP_AMM, async (logs) => {
-      if (logs.err) return;
-      // Pool creations have multiple CreateIdempotent + Initialize logs; swaps don't
-      const createCount = logs.logs.filter(l => l.includes('CreateIdempotent') || l.includes('Initialize the associated')).length;
-      if (createCount < 2) return;
-      if (!this._markSeen(`sol:ps:${logs.signature}`)) return;
+  _startSolana() {
+    const conn = this.connection;
+    this.lastActivity.solana = Date.now();
 
-      this._enqueue(async () => {
-        try {
-          const tx = await this.connection.getParsedTransaction(logs.signature, {
-            maxSupportedTransactionVersion: 0,
-            commitment: 'confirmed',
-          });
-          if (!tx) return;
-
-          const pool = this._extractPumpSwapPool(tx);
-          if (!pool) return;
-          if (!this._markSeen(`sol:mint:${pool.tokenMint}`)) return;
-
-          logger.info(`[scan] pumpswap pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
-          await this._emit({
-            chain: 'solana',
-            mint: pool.tokenMint,
-            deployer: pool.deployer,
-            poolAddress: pool.poolAddress,
-            dex: 'pumpswap',
-            liquidityNative: pool.liquiditySol,
-          });
-        } catch (err) {
-          logger.error(`[scan] pumpswap parse: ${err.message}`);
+    const sub = (program, handler) => {
+      const id = conn.onLogs(new PublicKey(program), (logs) => {
+        this.lastActivity.solana = Date.now();
+        if (logs.err) return;
+        try { handler(logs); } catch (err) {
+          logger.error(`[scan] ${program.slice(0, 6)} handler: ${err.message}`);
         }
-      });
-    }, 'confirmed');
-    this.subscriptions.push(() => this.connection.removeOnLogsListener(pumpSwapId));
-    logger.info('[scan] listening for PumpSwap pools (pump.fun graduates)');
+      }, 'confirmed');
+      this.subscriptions.push(() => conn.removeOnLogsListener(id));
+    };
 
-    // Raydium AMM V4 — legacy, still catches some tokens
-    const raydiumId = this.connection.onLogs(RAYDIUM_AMM_V4, async (logs) => {
-      if (logs.err) return;
-      if (!logs.logs.some(l => l.includes('initialize2'))) return;
-      if (!this._markSeen(`sol:ray:${logs.signature}`)) return;
-
-      this._enqueue(async () => {
-        try {
-          const tx = await this.connection.getParsedTransaction(logs.signature, {
-            maxSupportedTransactionVersion: 0,
-            commitment: 'confirmed',
-          });
-          if (!tx) return;
-
-          const pool = this._extractRaydiumPool(tx);
-          if (!pool) return;
-          if (!this._markSeen(`sol:mint:${pool.tokenMint}`)) return;
-
-          logger.info(`[scan] raydium pool ${pool.tokenMint} liq=${pool.liquiditySol.toFixed(2)} SOL`);
-          await this._emit({
-            chain: 'solana',
-            mint: pool.tokenMint,
-            deployer: pool.deployer,
-            poolAddress: pool.poolAddress,
-            dex: 'raydium',
-            liquidityNative: pool.liquiditySol,
-          });
-        } catch (err) {
-          logger.error(`[scan] raydium parse: ${err.message}`);
-        }
-      });
-    }, 'confirmed');
-    this.subscriptions.push(() => this.connection.removeOnLogsListener(raydiumId));
-    logger.info('[scan] listening for Raydium V4 pools');
+    sub(PROGRAMS.pumpswap, (logs) => this._onPumpSwapLogs(logs));
+    sub(PROGRAMS.raydiumV4, (logs) => this._onRaydiumLogs(logs));
+    logger.info('[scan] solana: listening for PumpSwap + Raydium V4 pool creations');
   }
 
-  _extractPumpSwapPool(tx) {
+  _onPumpSwapLogs({ signature, logs }) {
+    if (!isPumpSwapCreate(logs)) return;
+    if (!this._markSeen(`sol:sig:${signature}`)) return;
+
+    const pool = decodePumpSwapCreate(logs);
+    if (!pool) {
+      // Event missing (log truncation) — the pool is still real, so take the
+      // slow path rather than drop it.
+      stats.inc('solana', 'event_undecodable');
+      this._pumpSwapFallback(signature);
+      return;
+    }
+    if (pool.skip) {
+      stats.inc('solana', 'skipped_no_sol_pair');
+      return;
+    }
+    if (this.minLiquiditySol && pool.liquiditySol < this.minLiquiditySol) {
+      stats.inc('solana', 'skipped_low_liquidity');
+      return;
+    }
+
+    logger.info(
+      `[scan] pumpswap ${pool.graduated ? 'graduation' : 'pool'} ${pool.mint} ` +
+      `liq=${pool.liquiditySol.toFixed(2)} SOL`
+    );
+    this._emit({
+      chain: 'solana',
+      mint: pool.mint,
+      deployer: pool.deployer,
+      poolAddress: pool.pool,
+      lpMint: pool.lpMint,
+      dex: pool.graduated ? 'pumpswap' : 'pumpswap-direct',
+      liquidityNative: pool.liquiditySol,
+      priceNative: pool.priceNative,
+      decimals: pool.decimals,
+    });
+  }
+
+  _pumpSwapFallback(signature) {
+    const queued = this.txQueue.push(async () => {
+      const tx = await settle(this.connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      }), 15000, null);
+      const poolAddress = tx && findPumpSwapPoolInTx(tx);
+      if (!poolAddress) {
+        stats.inc('solana', 'tx_fetch_failed');
+        return;
+      }
+      const acct = await settle(this.connection.getAccountInfo(new PublicKey(poolAddress)), 8000, null);
+      const pool = decodePumpSwapPoolAccount(acct?.data);
+      if (!pool || pool.skip) return;
+      const bal = await settle(this.connection.getTokenAccountBalance(new PublicKey(pool.solVault)), 8000, null);
+      await this._emit({
+        chain: 'solana',
+        mint: pool.mint,
+        deployer: pool.deployer,
+        poolAddress,
+        lpMint: pool.lpMint,
+        dex: pool.graduated ? 'pumpswap' : 'pumpswap-direct',
+        liquidityNative: bal?.value?.uiAmount ?? null,
+      });
+    });
+    if (!queued) stats.inc('solana', 'queue_overflow');
+  }
+
+  _onRaydiumLogs({ signature, logs }) {
+    if (!isRaydiumInit(logs)) return;
+    if (!this._markSeen(`sol:sig:${signature}`)) return;
+
+    const queued = this.txQueue.push(async () => {
+      const tx = await settle(this.connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      }), 15000, null);
+      if (!tx) {
+        stats.inc('solana', 'tx_fetch_failed');
+        return;
+      }
+      const pool = extractRaydiumPool(tx);
+      if (!pool) return;
+      if (this.minLiquiditySol && pool.liquiditySol != null && pool.liquiditySol < this.minLiquiditySol) {
+        stats.inc('solana', 'skipped_low_liquidity');
+        return;
+      }
+      logger.info(`[scan] raydium pool ${pool.mint} liq=${pool.liquiditySol?.toFixed(2) ?? '?'} SOL`);
+      await this._emit({
+        chain: 'solana',
+        mint: pool.mint,
+        deployer: pool.deployer,
+        poolAddress: pool.pool,
+        lpMint: pool.lpMint,
+        dex: 'raydium',
+        liquidityNative: pool.liquiditySol,
+      });
+    });
+    if (!queued) stats.inc('solana', 'queue_overflow');
+  }
+
+  _checkLiveness() {
+    if (!this.enabled.solana) return;
+    const quiet = Date.now() - this.lastActivity.solana;
+    if (quiet < SOLANA_STALE_MS) return;
+
+    this.reconnects.solana++;
+    stats.inc('solana', 'ws_reconnect');
+    logger.warn(
+      `[scan] solana websocket delivered nothing for ${Math.round(quiet / 1000)}s — ` +
+      `rebuilding connection (reconnect #${this.reconnects.solana})`
+    );
+    this._teardownSolana();
     try {
-      const accounts = tx.transaction.message.accountKeys;
-      const deployer = accounts[0]?.pubkey?.toBase58();
-      let tokenMint = null;
-      let poolAddress = null;
-
-      // Find the PumpSwap instruction and its accounts
-      for (const ix of tx.transaction.message.instructions) {
-        if (ix.programId?.toBase58() !== PUMPSWAP_AMM.toBase58()) continue;
-        const ixAccounts = ix.accounts || [];
-        if (ixAccounts.length >= 5) {
-          poolAddress = ixAccounts[0]?.toBase58();
-        }
-        break;
-      }
-
-      // Find token mint from inner instructions (initializeAccount3 with non-WSOL mint)
-      for (const group of tx.meta?.innerInstructions || []) {
-        for (const ix of group.instructions || []) {
-          const parsed = ix.parsed;
-          if (!parsed) continue;
-          if (parsed.type === 'initializeAccount3' || parsed.type === 'initializeAccount') {
-            const mint = parsed.info?.mint;
-            if (mint && mint !== WSOL) { tokenMint = mint; break; }
-          }
-        }
-        if (tokenMint) break;
-      }
-
-      if (!tokenMint || tokenMint === WSOL) return null;
-
-      // Liquidity: sum SOL transferred in (look at token balance changes for WSOL account)
-      // Fall back to the deployer's balance drop
-      const pre = tx.meta?.preBalances || [];
-      const post = tx.meta?.postBalances || [];
-      let liquiditySol = 0;
-      for (let i = 0; i < Math.min(pre.length, 10); i++) {
-        const diff = (pre[i] - post[i]) / 1e9;
-        if (diff > 0.01 && diff < 100000) liquiditySol += diff;
-      }
-
-      return { tokenMint, poolAddress: poolAddress || 'unknown', deployer, liquiditySol: Math.max(liquiditySol, 0) };
+      this.connection = this.connectionFactory();
+      this._startSolana();
     } catch (err) {
-      logger.error(`[scan] pumpswap extract: ${err.message}`);
-      return null;
+      logger.error(`[scan] solana resubscribe failed: ${err.message}`);
     }
   }
 
-  _extractRaydiumPool(tx) {
-    try {
-      const accounts = tx.transaction.message.accountKeys;
-      const deployer = accounts[0]?.pubkey?.toBase58();
-      let tokenMint = null;
-      let poolAddress = null;
-
-      const allIx = [
-        ...tx.transaction.message.instructions,
-        ...(tx.meta?.innerInstructions || []).flatMap(i => i.instructions),
-      ];
-
-      for (const ix of allIx) {
-        if (ix.programId?.toBase58() !== RAYDIUM_AMM_V4.toBase58()) continue;
-        const ixAccounts = ix.accounts || [];
-        if (ixAccounts.length < 10) continue;
-        poolAddress = ixAccounts[4]?.toBase58();
-        const mintA = ixAccounts[8]?.toBase58();
-        const mintB = ixAccounts[9]?.toBase58();
-        tokenMint = mintA === WSOL ? mintB : mintA;
-        break;
-      }
-      if (!tokenMint || tokenMint === WSOL) return null;
-
-      const pre = tx.meta?.preBalances || [];
-      const post = tx.meta?.postBalances || [];
-      let liquiditySol = 0;
-      for (let i = 0; i < pre.length; i++) {
-        const diff = (pre[i] - post[i]) / 1e9;
-        if (diff > 0.05 && diff < 100000) liquiditySol = Math.max(liquiditySol, diff);
-      }
-
-      return { tokenMint, poolAddress, deployer, liquiditySol };
-    } catch (err) {
-      logger.error(`[scan] raydium extract: ${err.message}`);
-      return null;
+  _teardownSolana() {
+    for (const unsub of this.subscriptions) {
+      // Unsubscribing over a dead socket can reject; it must not throw here.
+      try { Promise.resolve(unsub()).catch(() => {}); } catch { /* already gone */ }
     }
+    this.subscriptions = [];
   }
 
   // ---------------------------------------------------------- Robinhood
 
   _startRobinhood() {
-    if (process.env.ROBINHOOD_SCANNER_ENABLED === 'false') {
-      logger.info('[scan] robinhood scanner disabled by config');
-      return;
-    }
+    let adapter;
+    try { adapter = this.swap.adapter('robinhood'); } catch { return; }
+
     try {
-      this.swap.adapter('robinhood').onNewPool(async ({ tokenAddress, poolId, poolKey }) => {
-        if (!this._markSeen(`rh:${poolId}`)) return;
-        if (!this._markSeen(`rh:mint:${tokenAddress}`)) return;
+      adapter.onNewPool(async ({ tokenAddress, poolId, poolKey, txHash }) => {
+        this.lastActivity.robinhood = Date.now();
+        if (!this.enabled.robinhood) return;
+        if (!this._markSeen(`rh:pool:${poolId}`)) return;
+
+        // The tx sender is the deployer: one cheap call, and without it
+        // Robinhood tokens had no deployer reputation at all.
+        const deployer = txHash
+          ? await settle(adapter.getTxSender(txHash), 5000, null)
+          : null;
+
         logger.info(`[scan] robinhood pool ${tokenAddress} fee=${poolKey.fee} spacing=${poolKey.tickSpacing}`);
         await this._emit({
           chain: 'robinhood',
           mint: tokenAddress,
-          deployer: null,
+          deployer,
           poolAddress: poolId,
           dex: 'uniswap-v4',
           liquidityNative: null,
           poolKey,
         });
+      }, {
+        // Polling proves liveness even when no pool lands.
+        onPoll: () => { this.lastActivity.robinhood = Date.now(); },
       });
     } catch (err) {
       // A dead Robinhood RPC must never take the Solana side down with it.
@@ -290,9 +285,8 @@ class Scanner {
 
   stop() {
     if (this._watchdog) clearInterval(this._watchdog);
-    for (const unsub of this.subscriptions) {
-      try { unsub(); } catch { /* already gone */ }
-    }
+    this._teardownSolana();
+    this.txQueue.clear();
     try { this.swap.adapter('robinhood').stopWatching(); } catch { /* never started */ }
   }
 }

@@ -1,5 +1,6 @@
 const { PublicKey } = require('@solana/web3.js');
 const logger = require('../utils/logger');
+const { singleFlight, withTimeout, settle } = require('../utils/async');
 
 const WSOL = 'So11111111111111111111111111111111111111112';
 const RUG_DRAWDOWN = 0.85; // -85% from peak with no liquidity left = rug
@@ -20,6 +21,9 @@ class Tracker {
     this.onSmartMoneyBuy = null;
     this.walletSubs = new Map();
     this._timer = null;
+    // A cycle over hundreds of tracked tokens can outlast the interval;
+    // overlapping cycles would double every snapshot.
+    this.snapshotAll = singleFlight(this._snapshotAll.bind(this));
   }
 
   start() {
@@ -49,14 +53,13 @@ class Tracker {
 
   // ---------------------------------------------------------- snapshots
 
-  async snapshotAll() {
+  async _snapshotAll() {
     const tokens = await this.db.getTokensToTrack();
     if (!tokens.length) return;
 
-    logger.debug?.(`[track] snapshotting ${tokens.length} tokens`);
     for (const t of tokens) {
       try {
-        await this.snapshotOne(t);
+        await withTimeout(this.snapshotOne(t), 20000, 'snapshot');
       } catch (err) {
         logger.error(`[track] ${t.chain}/${t.mint}: ${err.message}`);
       }
@@ -66,10 +69,10 @@ class Tracker {
   async snapshotOne(token) {
     const [market, nativeUsd] = await Promise.all([
       this.market.getPairData(token.chain, token.mint),
-      this.swap.getNativePriceUsd(token.chain).catch(() => null),
+      settle(this.swap.getNativePriceUsd(token.chain), 8000, null),
     ]);
 
-    const priceUsd = market?.priceUsd ?? await this.swap.getPrice(token.chain, token.mint);
+    const priceUsd = market?.priceUsd ?? await settle(this.swap.getPrice(token.chain, token.mint), 10000, null);
     if (priceUsd == null && !market) return; // nothing observable yet
 
     await this.db.saveSnapshot({

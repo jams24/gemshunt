@@ -13,11 +13,15 @@ const FALLBACK_PRICE = { solana: 150, robinhood: 2500 };
  * branches on chain and a new chain is one adapter away.
  */
 class SwapRouter {
-  constructor(solanaConnection) {
+  constructor(solanaConnection, { db } = {}) {
     this.adapters = {
       solana: new SolanaSwapAdapter(solanaConnection),
       robinhood: new EvmSwapAdapter(CHAINS.robinhood),
     };
+    // Used to recover V4 pool keys after a restart. Without it, a Robinhood
+    // position opened before a redeploy could never be priced again, so its
+    // TP/SL ladder silently stopped firing.
+    this.db = db || null;
     // CoinGecko's free tier rate-limits hard and the old code hit it on every
     // position check. One cached price per chain per minute is plenty.
     this._priceCache = new Map();
@@ -34,18 +38,39 @@ class SwapRouter {
   }
 
   async buy(chain, signer, mint, nativeAmount, slippageBps) {
+    if (chain !== 'solana') await this.resolvePoolKey(chain, mint);
     return this.adapter(chain).buy(signer, mint, nativeAmount, slippageBps);
   }
 
   async sell(chain, signer, mint, rawTokenAmount, slippageBps) {
+    if (chain !== 'solana') await this.resolvePoolKey(chain, mint);
     return this.adapter(chain).sell(signer, mint, rawTokenAmount, slippageBps);
   }
 
   /** USD price per whole token, or null when there's no route. */
   async getPrice(chain, mint, poolKey) {
     if (chain === 'solana') return this.adapter(chain).getPrice(mint);
+    const key = poolKey || await this.resolvePoolKey(chain, mint);
     const nativeUsd = await this.getNativePriceUsd(chain);
-    return this.adapter(chain).getPrice(mint, nativeUsd, poolKey);
+    return this.adapter(chain).getPrice(mint, nativeUsd, key);
+  }
+
+  /**
+   * The V4 pool key for a token: from the adapter's memory, else from the
+   * database row the scanner wrote when it first saw the pool.
+   */
+  async resolvePoolKey(chain, mint) {
+    const adapter = this.adapter(chain);
+    const known = adapter.knownPool?.(mint);
+    if (known || !this.db) return known || null;
+    try {
+      const row = await this.db.getToken(chain, mint);
+      if (row?.pool_key) {
+        adapter.rememberPool?.(mint, row.pool_key);
+        return row.pool_key;
+      }
+    } catch { /* fall through: unknown */ }
+    return null;
   }
 
   async getTokenInfo(chain, mint) {
@@ -53,13 +78,16 @@ class SwapRouter {
   }
 
   async checkSellable(chain, mint, decimals, poolKey) {
-    return this.adapter(chain).checkSellable(mint, decimals, poolKey);
+    const key = chain === 'solana' ? null : (poolKey || await this.resolvePoolKey(chain, mint));
+    return this.adapter(chain).checkSellable(mint, decimals, key);
   }
 
   /** Native-side pool depth, where the adapter can measure it. */
   async getLiquidityEstimate(chain, mint, poolKey) {
     const adapter = this.adapter(chain);
-    return adapter.getLiquidityEstimate ? adapter.getLiquidityEstimate(mint, poolKey) : null;
+    if (!adapter.getLiquidityEstimate) return null;
+    const key = poolKey || await this.resolvePoolKey(chain, mint);
+    return adapter.getLiquidityEstimate(mint, key);
   }
 
   /** Record a pool key discovered by the scanner so later quotes can use it. */
@@ -74,11 +102,17 @@ class SwapRouter {
 
     const id = COINGECKO_IDS[chain];
     try {
-      const { data } = await axios.get(
-        `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
-        { timeout: 5000 }
-      );
-      const price = data[id].usd;
+      // Jupiter prices SOL without CoinGecko's aggressive free-tier limits.
+      let price = chain === 'solana'
+        ? await this.adapters.solana.getPrice('So11111111111111111111111111111111111111112')
+        : null;
+      if (!price) {
+        const { data } = await axios.get(
+          `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
+          { timeout: 5000 }
+        );
+        price = data[id].usd;
+      }
       this._priceCache.set(chain, { price, expires: Date.now() + PRICE_TTL_MS });
       return price;
     } catch (err) {
