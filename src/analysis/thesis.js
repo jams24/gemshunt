@@ -40,10 +40,12 @@ function scoreBar(score) {
   return '█'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
+// Matches the scorer's own thresholds: 75+ needs real momentum, 60-74 is a
+// clean launch, 40-59 is the alert floor band.
 function scoreEmoji(score) {
-  if (score >= 85) return '🟢';
-  if (score >= 70) return '🟡';
-  if (score >= 55) return '🟠';
+  if (score >= 75) return '🟢';
+  if (score >= 60) return '🟡';
+  if (score >= 40) return '🟠';
   return '🔴';
 }
 

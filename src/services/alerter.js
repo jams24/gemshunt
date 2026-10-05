@@ -140,7 +140,9 @@ class Alerter {
     if (!sent) return { sent: 0, reason: 'already_alerted' };
     this.sentThisMinute++;
     this._rememberSymbol(token);
-    await this.db.markTokenAlerted(token.chain, token.mint);
+    await this.db.markTokenAlerted(token.chain, token.mint, {
+      score: analysis.score, marketCap: token.marketCap ?? token.initialMc ?? null,
+    });
     logger.info(`[alert] ${token.chain}/${token.symbol} (${analysis.score}, ${stage}) sent to ${sent} users`);
     return { sent, reason: 'sent' };
   }

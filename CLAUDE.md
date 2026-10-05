@@ -32,7 +32,8 @@ an adapter, that's the wrong layer.
 | `src/utils/async.js` | `withTimeout`, `settle`, `WorkQueue`, `singleFlight` |
 | `src/services/tracker.js` | Snapshots alerted tokens, outcomes, smart-money watching |
 | `src/engine/tradeEngine.js` | Buy/sell, position management, TP/SL |
-| `src/bot/telegramBot.js` | Telegram commands |
+| `src/bot/telegramBot.js` | Telegram commands, callback routing, polling supervisor |
+| `src/bot/panels.js` | Every inline screen (menu, positions, PnL, leaderboard, …) as `{ text, keyboard }` |
 | `test/run.js` | Integration tests (`npm test`, needs a scratch Postgres) |
 
 ## Pipeline
@@ -59,6 +60,34 @@ pools are not re-checked — nothing a re-check finds can rescue them.
 Every stage records what it did in `stats`; `/health` (admin) prints the
 funnel, and the health monitor tells the admin when pools are flowing but
 nothing has been alerted for 3h, with the breakdown of which filter ate them.
+
+## Track record (leaderboard, hit rate)
+
+A **call** is a token alerted to at least one user. `markTokenAlerted` fixes
+it on the first alert — `alerted_at`, `alert_score`, `alert_mc` — and later
+re-checks never move it. The leaderboard ranks calls by `peak_multiple`;
+runners that later rugged stay on it, marked 💀.
+
+`peak_multiple` is recomputed every tracker cycle from the token's own
+snapshots by `db.getPriceStats`, with three rules that each fixed a fake
+runner:
+- **Base = first price at/after the alert**, not before it.
+- **One price source.** Snapshots carrying `liquidity_usd` are DexScreener;
+  without it they are swap quotes. Once a token is indexed only DexScreener
+  prices count — dividing one source by the other produced 5–50x "pumps".
+- **Peaks on <$1k liquidity don't count.**
+The old code divided a running max by the oldest of the newest 500 snapshots
+— a base that slid forward after ~17h. `Tracker.rebaseHistory()` recomputes
+old rows once at startup (snapshots only, no RPC).
+
+## Bot UI
+
+Every screen lives in `bot/panels.js` and is reached through callback data
+`p:<panel>[:args]` (≤64 bytes). A button tap **edits the message in place**
+(`TelegramBot._show`); a slash command sends the same panel fresh. Callback
+regexes must be anchored (`^…$`): the unanchored `/chain_(solana|robinhood)/`
+also matched `alertchain_solana`, so toggling an alert chain switched the
+user's trading chain.
 
 The tracker loop is what makes scoring improve over time — it records what
 happened to every alerted token whether or not anyone bought it. `/analytics`

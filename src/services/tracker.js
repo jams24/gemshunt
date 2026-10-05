@@ -36,6 +36,7 @@ class Tracker {
       this.snapshotAll().catch(err => logger.error(`[track] cycle: ${err.message}`));
     }, ms);
     this._timer.unref?.();
+    this.rebaseHistory().catch(err => logger.error(`[track] rebase: ${err.message}`));
     logger.info(`[track] snapshotting every ${this.config.tracker.snapshotIntervalSec}s`);
   }
 
@@ -92,26 +93,31 @@ class Tracker {
   }
 
   /**
-   * Maintain peak multiple and a rug/runner/dud verdict. The multiple is taken
-   * against the FIRST observed price, so it measures what an alert-follower
-   * would actually have made, not what the token did before we saw it.
+   * Maintain peak multiple and a rug/runner verdict, recomputed from the
+   * token's own snapshots every cycle (see db.getPriceStats for the rules).
+   *
+   * This used to divide the running max price by the oldest of the newest
+   * 500 snapshots — a base that slid forward once a token had been tracked
+   * for ~17h — and mixed DexScreener prices with swap-quote prices. Both
+   * inflated multiples and put fake runners on the leaderboard.
    */
   async _updateOutcome(token, { priceUsd, market }) {
     if (priceUsd == null) return;
-
-    const history = await this.db.getSnapshots(token.chain, token.mint, 500);
-    const first = history[history.length - 1];
-    const basePrice = first?.price_usd || priceUsd;
-    if (!basePrice) return;
-
     const stored = await this.db.getToken(token.chain, token.mint);
-    const peakPrice = Math.max(stored?.peak_price_usd || 0, priceUsd);
-    const peakMultiple = peakPrice / basePrice;
+    if (!stored) return;
+    const s = await this.db.getPriceStats(token.chain, token.mint, { since: stored.alerted_at || null });
+    const base = s?.base?.price_usd;
+    if (!base) return;
 
-    const drawdownFromPeak = peakPrice > 0 ? 1 - priceUsd / peakPrice : 0;
-    const liquidityGone = market && market.liquidityUsd < 500;
+    const peakPrice = Math.max(s.peak?.price_usd || 0, base);
+    const peakMultiple = peakPrice / base;
+    const lastPrice = s.last?.price_usd ?? priceUsd;
+    const baseMc = s.base.market_cap ?? null;
 
-    let outcome = stored?.outcome || null;
+    const drawdownFromPeak = peakPrice > 0 ? 1 - lastPrice / peakPrice : 0;
+    const liquidityGone = market?.liquidityUsd != null && market.liquidityUsd < 500;
+
+    let outcome = stored.outcome || null;
     if (!outcome) {
       if (liquidityGone || drawdownFromPeak >= RUG_DRAWDOWN) outcome = 'rug';
       else if (peakMultiple >= 2) outcome = 'runner';
@@ -121,16 +127,58 @@ class Tracker {
     }
 
     await this.db.updateTokenOutcome(token.chain, token.mint, {
+      base_price_usd: base,
+      base_mc: baseMc,
       peak_price_usd: peakPrice,
       peak_multiple: peakMultiple,
+      peak_mc: s.peak?.market_cap ?? (baseMc ? baseMc * peakMultiple : null),
+      peak_at: s.peak?.taken_at ?? s.base.taken_at,
+      last_multiple: lastPrice / base,
       ...(outcome ? { outcome } : {}),
     });
 
-    const outcomeChanged = outcome && outcome !== stored?.outcome;
-    if (outcomeChanged && stored?.deployer) {
+    const outcomeChanged = outcome && outcome !== stored.outcome;
+    if (outcomeChanged && stored.deployer) {
       await this.db.recordDeployerOutcome(token.chain, stored.deployer, outcome, peakMultiple);
       logger.info(`[track] ${token.chain}/${stored.symbol} → ${outcome} (peak ${peakMultiple.toFixed(2)}x)`);
     }
+  }
+
+  /**
+   * One-off: recompute multiples stored by the old sliding-base logic. Reads
+   * snapshots only (no RPC), never changes an outcome — just the numbers the
+   * leaderboard ranks by.
+   */
+  async rebaseHistory() {
+    const tokens = await this.db.getTokensNeedingRebase();
+    let fixed = 0;
+    for (const t of tokens) {
+      try {
+        const s = await this.db.getPriceStats(t.chain, t.mint, { since: t.alerted_at || null });
+        const base = s?.base?.price_usd;
+        if (!base) {
+          // Nothing measurable after the alert — mark it so it isn't retried.
+          await this.db.updateTokenOutcome(t.chain, t.mint, { base_price_usd: 0, peak_multiple: null });
+          continue;
+        }
+        const peakPrice = Math.max(s.peak?.price_usd || 0, base);
+        const baseMc = s.base.market_cap ?? null;
+        await this.db.updateTokenOutcome(t.chain, t.mint, {
+          base_price_usd: base,
+          base_mc: baseMc,
+          peak_price_usd: peakPrice,
+          peak_multiple: peakPrice / base,
+          peak_mc: s.peak?.market_cap ?? (baseMc ? baseMc * (peakPrice / base) : null),
+          peak_at: s.peak?.taken_at ?? s.base.taken_at,
+          last_multiple: (s.last?.price_usd ?? base) / base,
+        });
+        fixed++;
+      } catch (err) {
+        logger.error(`[track] rebase ${t.chain}/${t.mint}: ${err.message}`);
+      }
+    }
+    if (fixed) logger.info(`[track] recomputed multiples for ${fixed} historical tokens`);
+    return fixed;
   }
 
   // ------------------------------------------------------- smart money

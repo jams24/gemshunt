@@ -3,8 +3,9 @@ const logger = require('../utils/logger');
 const db = require('../db/database');
 const CHAINS = require('../services/chains');
 const { generateTradeCard, generateMonthlyCard, formatHoldTime } = require('../services/pnlCard');
-const { renderAlert, money, scoreBar, scoreEmoji, esc } = require('../analysis/thesis');
+const { renderAlert, money, esc } = require('../analysis/thesis');
 const { withTimeout, sleep } = require('../utils/async');
+const panels = require('./panels');
 
 const REFERRAL_FEE_SHARE = parseFloat(process.env.REFERRAL_FEE_SHARE) || 0.25;
 
@@ -75,6 +76,65 @@ class TelegramBot {
   }
 
   // === HELPERS ===
+  isAdmin(id) {
+    return this.adminId != null && String(id) === String(this.adminId);
+  }
+
+  /**
+   * Show a panel: edit the message in place when a button was tapped, send a
+   * new one for a command. Falls back to sending when the original can't be
+   * edited (a photo, or older than Telegram allows).
+   */
+  async _show(ctx, panel) {
+    const { text, keyboard } = await panel;
+    const extra = {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: keyboard || [] },
+    };
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(text, extra);
+        return;
+      } catch (err) {
+        if (/message is not modified/i.test(err.description || err.message)) return;
+      }
+    }
+    await ctx.reply(text, extra);
+  }
+
+  /** Render a panel by name. Args come from callback data (`p:name:a:b`). */
+  async _panel(name, user, args = []) {
+    switch (name) {
+      case 'home': return panels.home(this, user);
+      case 'wallet': return panels.wallet(this, user);
+      case 'pos': return panels.positions(this, user);
+      case 'posd': return panels.positionDetail(this, user, args[0]);
+      case 'sellall': return panels.sellAllConfirm();
+      case 'pnl': return panels.pnl(this, user);
+      case 'lb': {
+        const days = Number.isFinite(parseInt(args[0], 10)) ? parseInt(args[0], 10) : 7;
+        const chain = CHAINS[args[1]] ? args[1] : 'all';
+        return panels.leaderboard(this, user, { days, chain });
+      }
+      case 'hit': return panels.hitRate(this, user, { days: Number.isFinite(parseInt(args[0], 10)) ? parseInt(args[0], 10) : 30 });
+      case 'pat': return panels.patterns();
+      case 'alerts': return panels.alerts(this, user);
+      case 'set': return panels.settings(this, user);
+      case 'watch': return panels.watchlist();
+      case 'ref': return panels.referral(this, user, { share: REFERRAL_FEE_SHARE });
+      case 'help': return panels.help(this);
+      case 'health': return this.isAdmin(user.telegram_id) ? panels.health(this) : panels.home(this, user);
+      case 'admin': return this.isAdmin(user.telegram_id) ? panels.admin() : panels.home(this, user);
+      default: return panels.home(this, user);
+    }
+  }
+
+  async _showPanel(ctx, name, args = []) {
+    const user = await db.getUser(ctx.from.id);
+    return this._show(ctx, this._panel(name, user, args));
+  }
+
   _chainInfo(user) {
     const chain = user.active_chain || 'solana';
     return { chain, ...CHAINS[chain] };
@@ -84,7 +144,7 @@ class TelegramBot {
     const c = CHAINS[chain] || CHAINS.solana;
     return Markup.keyboard([
       [`👛 Wallet`, `📊 Positions`],
-      [`💰 PnL`, `🎴 Card`],
+      [`💰 PnL`, `🏆 Leaderboard`],
       [`🔗 ${c.name}`, `📋 Menu`],
     ]).resize();
   }
@@ -230,14 +290,13 @@ class TelegramBot {
           new Promise(r => setTimeout(() => r(0), 5000)),
         ]);
 
-        return ctx.replyWithHTML(
-          `<b>⚡ SolSniper</b>\n\n` +
-          `Chain: <b>${info.emoji} ${info.name}</b>\n` +
-          `Wallet: <code>${walletAddr}</code>\n` +
-          `Balance: <b>${bal.toFixed(4)} ${info.currency}</b>\n\n` +
-          `Paste a token address to buy instantly.\nOr use /menu for all commands.`,
+        await ctx.replyWithHTML(
+          `<b>⚡ Welcome back</b>\n\n` +
+          `${info.emoji} <code>${walletAddr}</code>\n` +
+          `Balance: <b>${Number(bal || 0).toFixed(4)} ${info.currency}</b>`,
           this._mainKeyboard(info.chain)
         );
+        return this._show(ctx, panels.home(this, user));
       }
 
       ctx.replyWithHTML(
@@ -253,55 +312,8 @@ class TelegramBot {
       );
     });
 
-    this.bot.command('menu', async (ctx) => {
-      const user = await db.getUser(ctx.from.id);
-      const info = this._chainInfo(user);
-      await ctx.replyWithHTML(
-        `<b>📋 SolSniper — ${info.emoji} ${info.name}</b>\n\n` +
-        `<b>Trade:</b>\n` +
-        `• Paste token address to buy\n` +
-        `/buy <code>address</code> [amount] — Buy\n` +
-        `/sell <code>address</code> [%] — Sell\n` +
-        `/sellall — Close all\n\n` +
-        `<b>Portfolio:</b>\n` +
-        `/positions — Open positions\n` +
-        `/pnl — History | /stats — Stats\n` +
-        `/card — Monthly PnL card\n\n` +
-        `<b>Wallet:</b>\n` +
-        `/wallet — Balance & deposit\n` +
-        `/withdraw <code>addr</code> <code>amount</code>\n` +
-        `/export — Private key\n\n` +
-        `<b>Alerts & Research:</b>\n` +
-        `/alerts — Alert settings\n` +
-        `/setscore <code>0-100</code> · /setliq <code>usd</code>\n` +
-        `/scan <code>address</code> — Analyze a token\n` +
-        `/watch <code>wallet</code> — Track smart money\n` +
-        `/watchlist — Tracked wallets\n\n` +
-        `<b>Settings:</b>\n` +
-        `/chain — Switch chain\n` +
-        `/setbuy — Buy amount | /setslippage\n` +
-        `/autosell — Toggle TP/SL\n` +
-        `/referral — Earn fees\n` +
-        `/fees — Fee info`,
-        this._mainKeyboard(info.chain)
-      );
-      ctx.replyWithHTML('<b>📊 Quick Access</b>', {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '📈 Hit Rate', callback_data: 'nav_analytics' },
-              { text: '🏆 Leaderboard', callback_data: 'nav_leaderboard' },
-              { text: '📊 Patterns', callback_data: 'nav_patterns' },
-            ],
-            [
-              { text: '⚙️ Alerts', callback_data: 'menu_alerts' },
-              { text: '🔗 Chain', callback_data: 'switch_chain' },
-              { text: '📋 Watchlist', callback_data: 'menu_watchlist' },
-            ],
-          ],
-        },
-      });
-    });
+    this.bot.command('menu', (ctx) => this._showPanel(ctx, 'home'));
+    this.bot.command('help', (ctx) => this._showPanel(ctx, 'help'));
 
     // === CHAIN ===
     this.bot.command('chain', async (ctx) => {
@@ -315,19 +327,12 @@ class TelegramBot {
     // === WALLET ===
     // One screen for every chain — no drilling down, no /chain switch first.
     this.bot.command('wallet', async (ctx) => {
-      const user = await db.getUser(ctx.from.id);
-      if (!user.sol_wallet_address && !user.evm_wallet_address) {
-        return ctx.replyWithHTML(
-          `<b>👛 No wallets yet</b>\n\nCreate one for every chain in a single tap:`,
-          this._walletButtons(user)
-        );
-      }
       const loading = await ctx.reply('👛 Loading portfolio...');
-      const text = await this._renderPortfolio(user);
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, loading.message_id, undefined, text,
-        { parse_mode: 'HTML', disable_web_page_preview: true, ...this._walletButtons(user) }
-      );
+      const user = await db.getUser(ctx.from.id);
+      const { text, keyboard } = await panels.wallet(this, user);
+      await ctx.telegram.editMessageText(ctx.chat.id, loading.message_id, undefined, text, {
+        parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: keyboard },
+      });
     });
 
     this.bot.command('withdraw', async (ctx) => {
@@ -394,97 +399,18 @@ class TelegramBot {
     this.bot.command('sellall', async (ctx) => {
       const positions = await db.getUserPositions(ctx.from.id, 'open');
       if (!positions.length) return ctx.reply('No open positions.');
-      ctx.reply(`Closing ${positions.length} positions...`);
-      for (const pos of positions) {
-        try { await this.engine.sellToken(ctx.from.id, pos.mint, 1.0, pos.chain); } catch (e) { ctx.reply(`❌ ${pos.symbol}: ${e.message}`); }
-      }
-      ctx.reply('✅ Done.');
+      return this._show(ctx, panels.sellAllConfirm());
     });
 
     // === PORTFOLIO ===
-    this.bot.command('positions', async (ctx) => {
-      const positions = await db.getUserPositions(ctx.from.id, 'open');
-      if (!positions.length) return ctx.reply('No open positions.\n\nPaste a token address to buy!');
-
-      let msg = '<b>📊 Positions</b>\n\n';
-      for (const p of positions) {
-        const c = CHAINS[p.chain || 'solana'];
-        const emoji = (p.pnl_pct || 0) >= 0 ? (p.pnl_pct > 50 ? '🟢' : '🔵') : '🔴';
-        msg += `${emoji} ${c?.emoji || ''} <b>${esc(p.symbol || p.mint.slice(0, 8))}</b>\n`;
-        msg += `  ${(p.pnl_pct || 0) >= 0 ? '+' : ''}${(p.pnl_pct || 0).toFixed(1)}% | ${(p.current_mc || 0).toFixed(1)}x | ${formatHoldTime(p.opened_at)}\n`;
-        msg += `  <code>${p.mint}</code>\n\n`;
-      }
-      ctx.replyWithHTML(msg);
-    });
-
-    this.bot.command('pnl', async (ctx) => {
-      const closed = await db.getUserClosedPositions(ctx.from.id, 15);
-      if (!closed.length) return ctx.reply('No closed trades yet.');
-      let msg = '<b>💰 History</b>\n\n';
-      const totals = {};
-      for (const p of closed) {
-        const c = CHAINS[p.chain || 'solana'];
-        const emoji = p.pnl_sol >= 0 ? '🟢' : '🔴';
-        msg += `${emoji} ${c?.emoji || ''} <b>${esc(p.symbol || p.mint.slice(0, 6))}</b> ${p.pnl_pct >= 0 ? '+' : ''}${Number(p.pnl_pct).toFixed(0)}% | ${Number(p.pnl_sol).toFixed(4)} ${c?.currency || ''} | ${formatHoldTime(p.opened_at, p.closed_at)}\n`;
-        totals[p.chain || 'solana'] = (totals[p.chain || 'solana'] || 0) + Number(p.pnl_sol);
-      }
-      msg += '\n' + Object.entries(totals)
-        .map(([ch, v]) => `<b>Total ${CHAINS[ch]?.emoji || ''}: ${v >= 0 ? '+' : ''}${v.toFixed(4)} ${CHAINS[ch]?.currency || ''}</b>`)
-        .join('\n');
-      ctx.replyWithHTML(msg);
-    });
-
-    this.bot.command('stats', async (ctx) => {
-      const stats = await db.getUserStats(ctx.from.id);
-      if (!stats?.total_trades) return ctx.reply('No trades yet.');
-      const wr = stats.total_trades > 0 ? (stats.winning_trades / stats.total_trades * 100) : 0;
-      const { rows } = await db.query(
-        `SELECT chain, SUM(pnl_sol)::float AS pnl FROM positions
-         WHERE user_id = $1 AND status = 'closed' GROUP BY chain`, [ctx.from.id]
-      );
-      const pnlLines = rows.map(r => {
-        const c = CHAINS[r.chain] || CHAINS.solana;
-        return `PnL ${c.emoji}: <b>${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(4)} ${c.currency}</b>`;
-      });
-      ctx.replyWithHTML(
-        `<b>📈 Stats</b>\n\n` +
-        `Trades: <b>${stats.total_trades}</b> | WR: <b>${wr.toFixed(0)}%</b>\n` +
-        (pnlLines.length ? pnlLines.join('\n') + '\n' : '') +
-        `Open: <b>${stats.open_positions}</b>`
-      );
-    });
+    this.bot.command('positions', (ctx) => this._showPanel(ctx, 'pos'));
+    this.bot.command('pnl', (ctx) => this._showPanel(ctx, 'pnl'));
+    this.bot.command('stats', (ctx) => this._showPanel(ctx, 'pnl'));
 
     this.bot.command('card', (ctx) => this.sendMonthlyCard(ctx.from.id, ctx));
 
     // === SETTINGS ===
-    this.bot.command('settings', async (ctx) => {
-      const user = await db.getUser(ctx.from.id);
-      const info = this._chainInfo(user);
-      ctx.replyWithHTML(
-        `<b>⚙️ Settings</b>\n\n` +
-        `Chain: <b>${info.emoji} ${info.name}</b>\n` +
-        `Buy: <b>${user.max_buy_amount} ${info.currency}</b>\n` +
-        `Slippage: <b>${user.slippage_bps} bps</b>\n` +
-        `Auto-sell: <b>${user.auto_sell ? 'ON' : 'OFF'}</b>`,
-        Markup.inlineKeyboard([
-          [
-            Markup.button.callback('0.05', 'setbuy_0.05'),
-            Markup.button.callback('0.1', 'setbuy_0.1'),
-            Markup.button.callback('0.5', 'setbuy_0.5'),
-            Markup.button.callback('1.0', 'setbuy_1'),
-          ],
-          [
-            Markup.button.callback('Slip 1%', 'setslip_100'),
-            Markup.button.callback('5%', 'setslip_500'),
-            Markup.button.callback('10%', 'setslip_1000'),
-          ],
-          [
-            Markup.button.callback(`Auto-sell: ${user.auto_sell ? '✅' : '❌'}`, 'toggle_autosell'),
-            Markup.button.callback('🔗 Chain', 'switch_chain'),
-          ],
-        ])
-      );
-    });
+    this.bot.command('settings', (ctx) => this._showPanel(ctx, 'set'));
 
     this.bot.command('setbuy', async (ctx) => {
       const v = parseFloat(ctx.message.text.split(' ')[1]);
@@ -506,13 +432,7 @@ class TelegramBot {
       ctx.reply(`✅ Auto-sell ${!user.auto_sell ? 'ON' : 'OFF'}`);
     });
 
-    this.bot.command('referral', (ctx) => {
-      const link = `https://t.me/${this.bot.botInfo?.username || 'SolSniperBot'}?start=ref_${ctx.from.id}`;
-      ctx.replyWithHTML(
-        `<b>🔗 Referral</b>\n\n<code>${link}</code>\n\n` +
-        `Share → earn <b>${(REFERRAL_FEE_SHARE * 100).toFixed(0)}%</b> of their trading fees forever.`
-      );
-    });
+    this.bot.command('referral', (ctx) => this._showPanel(ctx, 'ref'));
 
     this.bot.command('fees', (ctx) => {
       ctx.replyWithHTML(
@@ -523,29 +443,14 @@ class TelegramBot {
       );
     });
 
-    this.bot.command('admin', async (ctx) => {
-      if (ctx.from.id !== this.adminId) return;
-      const { rows: [s] } = await db.query(`
-        SELECT (SELECT COUNT(*) FROM users) as users,
-        (SELECT COUNT(*) FROM users WHERE sol_wallet_address IS NOT NULL OR evm_wallet_address IS NOT NULL) as wallets,
-        (SELECT COUNT(*) FROM positions WHERE status='open') as open_pos,
-        (SELECT COUNT(*) FROM trades) as trades,
-        (SELECT COALESCE(SUM(fee_amount), 0) FROM fee_ledger) as fees
-      `);
-      ctx.replyWithHTML(
-        `<b>🔧 Admin</b>\n\n` +
-        `Users: <b>${s.users}</b> (${s.wallets} wallets)\n` +
-        `Open: <b>${s.open_pos}</b> | Trades: <b>${s.trades}</b>\n` +
-        `Fees: <b>${parseFloat(s.fees || 0).toFixed(4)}</b>`
-      );
+    this.bot.command('admin', (ctx) => {
+      if (!this.isAdmin(ctx.from.id)) return;
+      return this._showPanel(ctx, 'admin');
     });
 
     // === PASTE TOKEN ADDRESS TO BUY ===
     // === ALERTS ===
-    this.bot.command('alerts', async (ctx) => {
-      const user = await db.getUser(ctx.from.id);
-      ctx.replyWithHTML(this._renderAlertSettings(user), this._alertButtons(user));
-    });
+    this.bot.command('alerts', (ctx) => this._showPanel(ctx, 'alerts'));
 
     this.bot.command('setscore', async (ctx) => {
       const v = parseInt(ctx.message.text.split(' ')[1], 10);
@@ -595,176 +500,19 @@ class TelegramBot {
       ctx.reply('✅ Stopped tracking that wallet.');
     });
 
-    this.bot.command('watchlist', async (ctx) => {
-      const wallets = await db.getWatchedWallets();
-      if (!wallets.length) {
-        return ctx.replyWithHTML('No wallets tracked yet.\n\nAdd one: <code>/watch &lt;address&gt; [label]</code>');
-      }
-      const lines = wallets.map(w =>
-        `${CHAINS[w.chain]?.emoji || ''} <b>${w.label || w.address.slice(0, 8) + '…'}</b>\n  <code>${w.address}</code>`
-      );
-      ctx.replyWithHTML(`<b>🧠 Tracked wallets (${wallets.length})</b>\n\n${lines.join('\n')}`);
-    });
+    this.bot.command('watchlist', (ctx) => this._showPanel(ctx, 'watch'));
 
-    // === ANALYTICS — shared nav row across all three views ===
-    const _navRow = (active) => [
-      { text: active === 'analytics' ? '• 📈 Hit Rate' : '📈 Hit Rate', callback_data: 'nav_analytics' },
-      { text: active === 'leaderboard' ? '• 🏆 Leaders' : '🏆 Leaders', callback_data: 'nav_leaderboard' },
-      { text: active === 'patterns' ? '• 📊 Patterns' : '📊 Patterns', callback_data: 'nav_patterns' },
-    ];
-
-    const _renderAnalytics = async () => {
-      const bands = await db.getScoreBandPerformance();
-      if (!bands.length) return null;
-      const lines = ['<b>📈 Thesis engine performance</b>', '<i>Peak multiple reached after alert</i>', ''];
-      for (const b of bands) {
-        const rate2x = b.total ? ((b.hit_2x / b.total) * 100).toFixed(0) : '0';
-        const rugRate = b.total ? ((b.rugs / b.total) * 100).toFixed(0) : '0';
-        lines.push(
-          `<b>Score ${b.band}</b> — ${b.total} tokens\n` +
-          `  2x+: ${rate2x}%  ·  5x+: ${b.total ? ((b.hit_5x / b.total) * 100).toFixed(0) : 0}%  ·  rugs: ${rugRate}%\n` +
-          `  avg peak: ${b.avg_peak || '—'}x`
-        );
-      }
-      lines.push('', '<i>If the high bands don\'t beat the low ones, the scoring weights need tuning.</i>');
-      return lines.join('\n');
-    };
-
-    const _renderLeaderboard = async (days = 7) => {
-      const { scoreEmoji: se, money: m } = require('../analysis/thesis');
-      const tokens = await db.getLeaderboard(days, 10);
-      if (!tokens.length) return null;
-      const label = days >= 9999 ? 'All Time' : `${days}d`;
-      const lines = [`🏆 <b>TOP PERFORMERS — Last ${label}</b>`, ''];
-      tokens.forEach((t, i) => {
-        const chain = CHAINS[t.chain] || CHAINS.solana;
-        const mc = t.initial_mc ? m(t.initial_mc) : '—';
-        const peakMc = t.peak_price_usd && t.initial_mc && t.peak_multiple
-          ? m(t.initial_mc * t.peak_multiple) : '—';
-        const date = t.detected_at ? new Date(t.detected_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
-        lines.push(
-          `${i + 1}. ${se(t.score || 0)} <b>${esc(t.symbol || 'UNKNOWN')}</b> [${Number(t.peak_multiple).toFixed(1)}x] — Score ${t.score ?? '?'}\n` +
-          `   MC: ${mc} → ${peakMc}  ·  ${chain.emoji} ${chain.name}${date ? `  ·  ${date}` : ''}\n` +
-          `   <code>${t.mint}</code>`
-        );
-      });
-      return { text: lines.join('\n'), days };
-    };
-
-    const _renderPatterns = async () => {
-      const { money: m } = require('../analysis/thesis');
-      const p = await db.getPatternAnalysis(5, 30);
-      if (!p || !p.total) return null;
-      const winRate = p.total > 0 ? ((p.winners / p.total) * 100).toFixed(1) : '0';
-      const lines = [
-        `📊 <b>WINNING TOKEN PATTERNS</b> (5x+ runners, last 30d)`,
-        '',
-        `Winners: <b>${p.winners}</b> / ${p.total} tokens (${winRate}%)`,
-        '',
-        `Avg Score: <b>${p.avg_score_winners || '—'}</b> (vs ${p.avg_score || '—'} overall)`,
-        `Avg MC at detection: <b>${m(p.avg_mc_winners)}</b> (vs ${m(p.avg_mc)})`,
-        `Avg Liquidity: <b>${p.avg_liq_winners ? p.avg_liq_winners + ' SOL' : '—'}</b> (vs ${p.avg_liq ? p.avg_liq + ' SOL' : '—'})`,
-        `Avg Dev Hold: <b>${p.avg_dev_pct_winners != null ? p.avg_dev_pct_winners + '%' : '—'}</b> (vs ${p.avg_dev_pct != null ? p.avg_dev_pct + '%' : '—'})`,
-        `Avg Holders at detect: <b>${p.avg_holders_winners || '—'}</b> (vs ${p.avg_holders || '—'})`,
-        '',
-      ];
-      if (p.pct_mint_revoked_winners != null) lines.push(`✅ ${p.pct_mint_revoked_winners}% had mint revoked`);
-      if (p.pct_lp_burned_winners != null) lines.push(`✅ ${p.pct_lp_burned_winners}% had LP burned >80%`);
-      lines.push('', '<i>Compare winner averages vs overall to spot edge signals.</i>');
-      return lines.join('\n');
-    };
-
-    const _lbTimeRow = (days) => [
-      { text: days === 1 ? '• 24h' : '24h', callback_data: 'lb_1' },
-      { text: days === 7 ? '• 7d' : '7d', callback_data: 'lb_7' },
-      { text: days === 30 ? '• 30d' : '30d', callback_data: 'lb_30' },
-      { text: days >= 9999 ? '• All' : 'All', callback_data: 'lb_9999' },
-    ];
-
-    this.bot.command('analytics', async (ctx) => {
-      const html = await _renderAnalytics();
-      if (!html) return ctx.reply('Not enough tracked tokens yet.');
-      ctx.replyWithHTML(html, { reply_markup: { inline_keyboard: [_navRow('analytics')] } });
-    });
-
+    // === TRACK RECORD ===
     this.bot.command('leaderboard', async (ctx) => {
-      const arg = (ctx.message.text.split(' ')[1] || '7').replace(/[^0-9]/g, '');
-      const days = parseInt(arg, 10) || 7;
-      const result = await _renderLeaderboard(days);
-      if (!result) return ctx.reply('No tracked tokens with peak data yet.');
-      ctx.replyWithHTML(result.text, {
-        reply_markup: { inline_keyboard: [_lbTimeRow(result.days), _navRow('leaderboard')] },
-      });
-    });
-
-    this.bot.action(/lb_(\d+)/, async (ctx) => {
-      const days = parseInt(ctx.match[1], 10);
-      const result = await _renderLeaderboard(days);
-      if (!result) return ctx.answerCbQuery('No data');
-      ctx.answerCbQuery();
-      ctx.editMessageText(result.text, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [_lbTimeRow(result.days), _navRow('leaderboard')] },
-      });
-    });
-
-    this.bot.command('patterns', async (ctx) => {
-      const html = await _renderPatterns();
-      if (!html) return ctx.reply('Not enough data yet.');
-      ctx.replyWithHTML(html, { reply_markup: { inline_keyboard: [_navRow('patterns')] } });
-    });
-
-    this.bot.action('nav_analytics', async (ctx) => {
-      const html = await _renderAnalytics();
-      if (!html) return ctx.answerCbQuery('No data yet');
-      ctx.answerCbQuery();
-      ctx.editMessageText(html, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [_navRow('analytics')] },
-      });
-    });
-
-    this.bot.action('nav_leaderboard', async (ctx) => {
-      const result = await _renderLeaderboard(7);
-      if (!result) return ctx.answerCbQuery('No data yet');
-      ctx.answerCbQuery();
-      ctx.editMessageText(result.text, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [_lbTimeRow(7), _navRow('leaderboard')] },
-      });
-    });
-
-    this.bot.action('nav_patterns', async (ctx) => {
-      const html = await _renderPatterns();
-      if (!html) return ctx.answerCbQuery('No data yet');
-      ctx.answerCbQuery();
-      ctx.editMessageText(html, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [_navRow('patterns')] },
-      });
-    });
-
-    this.bot.action('menu_alerts', async (ctx) => {
+      const { days, chain } = panels.parseLeaderboardArgs(ctx.message.text.split(/\s+/).slice(1));
       const user = await db.getUser(ctx.from.id);
-      ctx.answerCbQuery();
-      ctx.reply('⚙️ Alert settings:');
-      ctx.replyWithHTML(this._renderAlertSettings(user), this._alertButtons(user));
+      return this._show(ctx, panels.leaderboard(this, user, { days, chain }));
     });
-
-    this.bot.action('menu_watchlist', async (ctx) => {
-      ctx.answerCbQuery();
-      const wallets = await db.getWatchedWallets();
-      if (!wallets.length) return ctx.reply('No watched wallets yet. Use /watch <address> to add one.');
-      const lines = ['<b>👀 Watched Wallets</b>', ''];
-      for (const w of wallets) {
-        const label = w.label || w.address.slice(0, 8) + '…';
-        lines.push(`${CHAINS[w.chain]?.emoji || '◎'} <b>${label}</b>\n  <code>${w.address}</code>`);
-      }
-      ctx.replyWithHTML(lines.join('\n'));
-    });
+    this.bot.command('analytics', (ctx) => this._showPanel(ctx, 'hit', ['30']));
+    this.bot.command('patterns', (ctx) => this._showPanel(ctx, 'pat'));
 
     this.bot.command('scanchain', async (ctx) => {
-      if (String(ctx.from.id) !== String(this.adminId)) return;
+      if (!this.isAdmin(ctx.from.id)) return;
       const args = ctx.message.text.split(/\s+/).slice(1);
       if (!args.length) {
         const solOn = this.scanner ? this.scanner.enabled.solana : true;
@@ -787,9 +535,8 @@ class TelegramBot {
     });
 
     this.bot.command('health', async (ctx) => {
-      if (String(ctx.from.id) !== String(this.adminId)) return;
-      if (!this.health) return ctx.reply('Health monitor not attached.');
-      await ctx.replyWithHTML(await this.health.status());
+      if (!this.isAdmin(ctx.from.id)) return;
+      return this._showPanel(ctx, 'health');
     });
 
     this.bot.command('setliq', async (ctx) => {
@@ -829,7 +576,8 @@ class TelegramBot {
         '👛 Wallet': 'wallet',
         '📊 Positions': 'positions',
         '💰 PnL': 'pnl',
-        '🎴 Card': 'card',
+        '🏆 Leaderboard': 'leaderboard',
+        '🎴 Card': 'card', // keyboards sent before the leaderboard button
         '📋 Menu': 'menu',
         '⚙️ Settings': 'settings',
       };
@@ -843,8 +591,56 @@ class TelegramBot {
   }
 
   setupCallbacks() {
+    // === PANELS ===
+    // Every inline screen. Answer the callback first: Telegram shows a spinner
+    // on the button until it is answered, and the window is only ~15s.
+    this.bot.action(/^p:([a-z]+)((?::[\w.-]+)*)$/, async (ctx) => {
+      const [, name, rest] = ctx.match;
+      await ctx.answerCbQuery(name === 'wallet' ? 'Loading portfolio…' : undefined).catch(() => {});
+      if (name === 'card') return this.sendMonthlyCard(ctx.from.id, ctx);
+      return this._showPanel(ctx, name, rest ? rest.slice(1).split(':') : []);
+    });
+
+    // Buttons on messages sent by older versions of the bot.
+    const legacy = {
+      nav_leaderboard: ['lb', ['7', 'all']], nav_analytics: ['hit', ['30']], nav_patterns: ['pat', []],
+      menu_alerts: ['alerts', []], menu_watchlist: ['watch', []],
+    };
+    for (const [data, [name, args]] of Object.entries(legacy)) {
+      this.bot.action(data, async (ctx) => {
+        await ctx.answerCbQuery().catch(() => {});
+        return this._showPanel(ctx, name, args);
+      });
+    }
+    this.bot.action(/^lb_(\d+)$/, async (ctx) => {
+      await ctx.answerCbQuery().catch(() => {});
+      const d = parseInt(ctx.match[1], 10);
+      return this._showPanel(ctx, 'lb', [String(d >= 9999 ? 0 : d), 'all']);
+    });
+
+    this.bot.action('sellall_yes', async (ctx) => {
+      await ctx.answerCbQuery('Selling everything…').catch(() => {});
+      const positions = await db.getUserPositions(ctx.from.id, 'open');
+      if (!positions.length) return this._show(ctx, panels.positions(this, await db.getUser(ctx.from.id)));
+      await this._show(ctx, { text: `⏳ Closing ${positions.length} position(s)…`, keyboard: [] });
+      const results = [];
+      for (const pos of positions) {
+        const c = CHAINS[pos.chain] || CHAINS.solana;
+        try {
+          const r = await this.engine.sellToken(ctx.from.id, pos.mint, 1.0, pos.chain);
+          results.push(`✅ ${c.emoji} ${esc(pos.symbol || pos.mint.slice(0, 6))}` +
+            (r?.pnlSol != null ? ` ${r.pnlSol >= 0 ? '+' : ''}${Number(r.pnlSol).toFixed(4)} ${c.currency}` : ''));
+        } catch (e) {
+          results.push(`❌ ${c.emoji} ${esc(pos.symbol || pos.mint.slice(0, 6))}: ${esc(e.message).slice(0, 80)}`);
+        }
+      }
+      await ctx.replyWithHTML(`<b>Sell all</b>\n\n${results.join('\n')}`, {
+        reply_markup: { inline_keyboard: [[{ text: '📊 Positions', callback_data: 'p:pos' }, { text: '« Menu', callback_data: 'p:home' }]] },
+      });
+    });
+
     // === ONBOARDING ===
-    this.bot.action(/onboard_(solana|robinhood)/, async (ctx) => {
+    this.bot.action(/^onboard_(solana|robinhood)$/, async (ctx) => {
       const chain = ctx.match[1];
       await ctx.answerCbQuery();
       await db.updateUser(ctx.from.id, { active_chain: chain });
@@ -862,7 +658,9 @@ class TelegramBot {
     });
 
     // === CHAIN SWITCH ===
-    this.bot.action(/chain_(solana|robinhood)/, async (ctx) => {
+    // Anchored: unanchored, this also matched `alertchain_solana`, so toggling
+    // an alert chain switched the user's active trading chain instead.
+    this.bot.action(/^chain_(solana|robinhood)$/, async (ctx) => {
       const chain = ctx.match[1];
       await db.updateUser(ctx.from.id, { active_chain: chain });
       const info = CHAINS[chain];
@@ -951,27 +749,36 @@ class TelegramBot {
       await this._executeSell(ctx, mint, pct);
     });
 
-    this.bot.action(/sellmenu_(.+)/, async (ctx) => {
+    this.bot.action(/^sellmenu_(.+)$/, async (ctx) => {
       await ctx.answerCbQuery();
       ctx.replyWithHTML(`<b>Sell:</b>`, this._sellButtons(ctx.match[1]));
     });
 
     // === SETTINGS ===
-    this.bot.action(/setbuy_(.+)/, async (ctx) => {
-      const v = parseFloat(ctx.match[1]);
-      await db.updateUser(ctx.from.id, { max_buy_amount: v });
-      await ctx.answerCbQuery(`Buy: ${v}`);
-    });
-    this.bot.action(/setslip_(\d+)/, async (ctx) => {
-      const v = parseInt(ctx.match[1]);
-      await db.updateUser(ctx.from.id, { slippage_bps: v });
-      await ctx.answerCbQuery(`Slippage: ${v} bps`);
-    });
-    this.bot.action('toggle_autosell', async (ctx) => {
+    // Each change re-renders the settings panel so the selection marker moves;
+    // previously the buttons only flashed a toast and the screen kept showing
+    // the old values.
+    const settingsChange = (pattern, apply) => this.bot.action(pattern, async (ctx) => {
       const user = await db.getUser(ctx.from.id);
-      await db.updateUser(ctx.from.id, { auto_sell: !user.auto_sell });
-      await ctx.answerCbQuery(`Auto-sell: ${!user.auto_sell ? 'ON' : 'OFF'}`);
+      const { updates, toast } = apply(ctx.match, user);
+      await db.updateUser(ctx.from.id, updates);
+      await ctx.answerCbQuery(toast).catch(() => {});
+      return this._showPanel(ctx, 'set');
     });
+    settingsChange(/^setbuy_([\d.]+)$/, (m) => {
+      const v = parseFloat(m[1]);
+      return { updates: { max_buy_amount: v }, toast: `Buy: ${v}` };
+    });
+    settingsChange(/^setslip_(\d+)$/, (m) => {
+      const v = parseInt(m[1], 10);
+      return { updates: { slippage_bps: v }, toast: `Slippage: ${v / 100}%` };
+    });
+    settingsChange(/^toggle_autosell$/, (m, user) => ({
+      updates: { auto_sell: !user.auto_sell }, toast: `Auto-sell: ${!user.auto_sell ? 'ON' : 'OFF'}`,
+    }));
+    settingsChange(/^setchain_(solana|robinhood)$/, (m) => ({
+      updates: { active_chain: m[1] }, toast: `Active chain: ${CHAINS[m[1]].name}`,
+    }));
 
     // === WALLET ACTIONS ===
     this.bot.action('wallet_refresh', async (ctx) => {
@@ -1011,10 +818,7 @@ class TelegramBot {
       const next = !user.alerts_enabled;
       await db.updateUser(ctx.from.id, { alerts_enabled: next });
       await ctx.answerCbQuery(next ? 'Alerts ON' : 'Alerts OFF');
-      const fresh = await db.getUser(ctx.from.id);
-      await ctx.editMessageText(this._renderAlertSettings(fresh), {
-        parse_mode: 'HTML', ...this._alertButtons(fresh),
-      }).catch(() => {});
+      await this._showPanel(ctx, 'alerts');
     });
 
     this.bot.action('alerts_off', async (ctx) => {
@@ -1022,24 +826,18 @@ class TelegramBot {
       await ctx.answerCbQuery('Alerts muted. Re-enable with /alerts');
     });
 
-    this.bot.action(/alertscore_(\d+)/, async (ctx) => {
+    this.bot.action(/^alertscore_(\d+)$/, async (ctx) => {
       const v = parseInt(ctx.match[1], 10);
       await db.updateUser(ctx.from.id, { alert_min_score: v });
       await ctx.answerCbQuery(`Min score: ${v}`);
-      const fresh = await db.getUser(ctx.from.id);
-      await ctx.editMessageText(this._renderAlertSettings(fresh), {
-        parse_mode: 'HTML', ...this._alertButtons(fresh),
-      }).catch(() => {});
+      await this._showPanel(ctx, 'alerts');
     });
 
     this.bot.action(/^alertliq_(\d+)$/, async (ctx) => {
       const v = parseInt(ctx.match[1], 10);
       await db.updateUser(ctx.from.id, { alert_min_liq_usd: v });
       await ctx.answerCbQuery(v ? `Min liquidity: ${money(v)}` : 'Liquidity filter off');
-      const fresh = await db.getUser(ctx.from.id);
-      await ctx.editMessageText(this._renderAlertSettings(fresh), {
-        parse_mode: 'HTML', ...this._alertButtons(fresh),
-      }).catch(() => {});
+      await this._showPanel(ctx, 'alerts');
     });
 
     this.bot.action(/^alertchain_(solana|robinhood)$/, async (ctx) => {
@@ -1049,10 +847,7 @@ class TelegramBot {
       if (current.has(chain)) current.delete(chain); else current.add(chain);
       await db.updateUser(ctx.from.id, { alert_chains: [...current].join(',') });
       await ctx.answerCbQuery(`${CHAINS[chain].name}: ${current.has(chain) ? 'on' : 'off'}`);
-      const fresh = await db.getUser(ctx.from.id);
-      await ctx.editMessageText(this._renderAlertSettings(fresh), {
-        parse_mode: 'HTML', ...this._alertButtons(fresh),
-      }).catch(() => {});
+      await this._showPanel(ctx, 'alerts');
     });
 
     // Buy straight from an alert. The chain rides in the callback data, so
@@ -1128,9 +923,10 @@ class TelegramBot {
           `alertliq_${v}`
         )
       ),
-      Object.entries(CHAINS).map(([k, c]) =>
-        Markup.button.callback(`${c.emoji} ${c.name}`, `alertchain_${k}`)
-      ),
+      Object.entries(CHAINS).map(([k, c]) => {
+        const on = (user.alert_chains || 'solana,robinhood').split(',').includes(k);
+        return Markup.button.callback(`${on ? '✅' : '⬜'} ${c.emoji} ${c.name}`, `alertchain_${k}`);
+      }),
     ]);
   }
 

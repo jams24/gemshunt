@@ -616,6 +616,169 @@ async function robustness() {
   });
 }
 
+
+async function trackRecordAndPanels() {
+  section('Track record, leaderboard and panels');
+  const snap = (mint, price, minsAgo, { liq = 50000, mc = null } = {}) => db.query(
+    `INSERT INTO token_snapshots (chain, mint, price_usd, liquidity_usd, market_cap, taken_at)
+     VALUES ('solana', $1, $2, $3, $4, NOW() - ($5 || ' minutes')::interval)`,
+    [mint, price, liq, mc ?? price * 1e9, minsAgo]
+  );
+  const market = { getPairData: async () => market._data };
+  const swap = { getNativePriceUsd: async () => 150, getPrice: async () => market._data?.priceUsd ?? null };
+  const tracker = new Tracker({ db, swapRouter: swap, marketData: market, connection: null,
+    config: { tracker: { enabled: true, snapshotIntervalSec: 120, trackHours: 24 } } });
+
+  await t('the base never slides: a 1000-snapshot history still measures from the first price', async () => {
+    await db.saveToken({ chain: 'solana', mint: 'LONG', symbol: 'LONG', score: 65, trackingUntil: tracker.trackingDeadline() });
+    await db.markTokenAlerted('solana', 'LONG', { score: 65 });
+    await db.query(`UPDATE tokens SET alerted_at = NOW() - interval '2000 minutes' WHERE mint='LONG'`);
+    // Price climbs 1 -> 2 over the first half, then sits at 2. The old code
+    // divided by the oldest of the newest 500 rows (price 2) and reported 1x.
+    await db.query(
+      `INSERT INTO token_snapshots (chain, mint, price_usd, liquidity_usd, market_cap, taken_at)
+       SELECT 'solana', 'LONG', LEAST(1 + g / 500.0, 2), 50000, 1e6, NOW() - ((1000 - g) || ' minutes')::interval
+       FROM generate_series(0, 999) g`
+    );
+    market._data = { priceUsd: 2, liquidityUsd: 50000, marketCap: 2e6 };
+    await tracker.snapshotOne({ chain: 'solana', mint: 'LONG' });
+    const tk = await db.getToken('solana', 'LONG');
+    if (Math.abs(tk.peak_multiple - 2) > 0.01) throw new Error(`peak ${tk.peak_multiple}`);
+  });
+
+  await t('a quote price is never divided into a DexScreener price (no fake runner)', async () => {
+    await db.saveToken({ chain: 'solana', mint: 'MIX', symbol: 'MIX', score: 60, trackingUntil: tracker.trackingDeadline() });
+    await db.markTokenAlerted('solana', 'MIX', { score: 60 });
+    // Un-indexed: swap quote says 0.0001. Then DexScreener indexes at 0.001.
+    market._data = null;
+    swap.getPrice = async () => 0.0001;
+    await tracker.snapshotOne({ chain: 'solana', mint: 'MIX' });
+    market._data = { priceUsd: 0.001, liquidityUsd: 40000, marketCap: 1e6 };
+    await tracker.snapshotOne({ chain: 'solana', mint: 'MIX' });
+    const tk = await db.getToken('solana', 'MIX');
+    if (tk.peak_multiple > 1.01) throw new Error(`fake ${tk.peak_multiple}x from mixed sources`);
+  });
+
+  await t('the multiple is measured from the alert, not from before it', async () => {
+    await db.saveToken({ chain: 'solana', mint: 'LATE', symbol: 'LATE', score: 70, trackingUntil: tracker.trackingDeadline() });
+    await snap('LATE', 1, 30);   // pre-alert pump from 1 -> 4
+    await snap('LATE', 4, 10);
+    await db.markTokenAlerted('solana', 'LATE', { score: 70 });
+    market._data = { priceUsd: 5, liquidityUsd: 50000, marketCap: 5e9 };
+    await tracker.snapshotOne({ chain: 'solana', mint: 'LATE' });
+    await db.query(`UPDATE token_snapshots SET taken_at = NOW() - interval '30 seconds' WHERE mint='LATE' AND price_usd=5`);
+    market._data = { priceUsd: 10, liquidityUsd: 50000, marketCap: 1e10 };
+    await tracker.snapshotOne({ chain: 'solana', mint: 'LATE' });
+    const tk = await db.getToken('solana', 'LATE');
+    if (Math.abs(tk.peak_multiple - 2) > 0.01) throw new Error(`peak ${tk.peak_multiple}, want 2 (5 -> 10)`);
+  });
+
+  await t('a peak printed on dust liquidity does not count', async () => {
+    await db.saveToken({ chain: 'solana', mint: 'DUST', symbol: 'DUST', score: 60, trackingUntil: tracker.trackingDeadline() });
+    await db.markTokenAlerted('solana', 'DUST', { score: 60 });
+    market._data = { priceUsd: 1, liquidityUsd: 30000, marketCap: 1e6 };
+    await tracker.snapshotOne({ chain: 'solana', mint: 'DUST' });
+    market._data = { priceUsd: 40, liquidityUsd: 120, marketCap: 4e7 };
+    await tracker.snapshotOne({ chain: 'solana', mint: 'DUST' });
+    const tk = await db.getToken('solana', 'DUST');
+    if (tk.peak_multiple > 1.01) throw new Error(`dust spike counted: ${tk.peak_multiple}x`);
+  });
+
+  await t('the leaderboard lists only alerted calls, keeps runners that later rugged, and uses the alert score', async () => {
+    await db.saveToken({ chain: 'solana', mint: 'QUIET', symbol: 'QUIET', score: 50 });
+    await db.updateTokenOutcome('solana', 'QUIET', { peak_multiple: 50 }); // tracked, never alerted
+    await db.saveToken({ chain: 'solana', mint: 'BOOM', symbol: 'BOOM', score: 72 });
+    await db.markTokenAlerted('solana', 'BOOM', { score: 72 });
+    await db.saveToken({ chain: 'solana', mint: 'BOOM', symbol: 'BOOM', score: 30 }); // later re-check
+    await db.updateTokenOutcome('solana', 'BOOM', { peak_multiple: 8, outcome: 'rug' });
+    const rows = await db.getLeaderboard({ days: 7 });
+    if (rows.some(r => r.mint === 'QUIET')) throw new Error('un-alerted token on the board');
+    const boom = rows.find(r => r.mint === 'BOOM');
+    if (!boom) throw new Error('runner that later rugged was dropped');
+    eq(boom.score, 72, 'score shown is the one alerted');
+    eq(rows[0].mint, 'BOOM', 'ranked by peak');
+    const stats = await db.getCallStats({ days: 7 });
+    if (!(stats.calls >= 4)) throw new Error(`calls ${stats.calls}`);
+  });
+
+  await t('/leaderboard arguments: 24h is one day, not 24; chain shortcuts work', async () => {
+    const { parseLeaderboardArgs } = require('../src/bot/panels');
+    eq(JSON.stringify(parseLeaderboardArgs(['24h'])), JSON.stringify({ days: 1, chain: 'all' }), '24h');
+    eq(JSON.stringify(parseLeaderboardArgs(['all', 'rh'])), JSON.stringify({ days: 0, chain: 'robinhood' }), 'all rh');
+    eq(JSON.stringify(parseLeaderboardArgs(['30d', 'sol'])), JSON.stringify({ days: 30, chain: 'solana' }), '30d sol');
+  });
+
+  // Drive the real bot through Telegraf with a fake transport.
+  const TelegramBot = require('../src/bot/telegramBot');
+  const tb = new TelegramBot({
+    tradeEngine: { onTradeEvent: null, sellToken: async () => ({ pnlSol: 0.1 }) },
+    walletManager: { isValidAddress: () => true, getPortfolio: async () => ({ totalUsd: 0, chains: [] }) },
+    swapRouter: { getNativePriceUsd: async () => 150 }, analyzer: {}, tracker: {},
+    config: { telegram: { token: '123:ABC', adminId: 777 }, trading: { platformFeePct: 1 } },
+  });
+  tb.bot.botInfo = { username: 'testbot', id: 1 };
+  const calls = [];
+  // handleUpdate builds a fresh Telegram client per update, so the transport
+  // has to be stubbed on the prototype (restored at the end of the suite).
+  const { Telegram } = require('telegraf');
+  const realCallApi = Telegram.prototype.callApi;
+  Telegram.prototype.callApi = async (method, payload) => { calls.push({ method, payload }); return { message_id: 9 }; };
+  const errors = [];
+  tb._handleError = (err) => errors.push(err.message);
+  let uid = 7000;
+  const tap = async (userId, data) => {
+    calls.length = 0;
+    await tb.bot.handleUpdate({ update_id: ++uid, callback_query: {
+      id: String(uid), data, chat_instance: '1', from: { id: userId, is_bot: false, first_name: 'x' },
+      message: { message_id: 5, date: 0, chat: { id: userId, type: 'private' }, text: 'old' },
+    } });
+    for (let i = 0; i < 100 && !calls.some(c => /^(editMessageText|sendMessage|sendPhoto)$/.test(c.method)) && !errors.length; i++) await sleep(10);
+    return calls.find(c => /^(editMessageText|sendMessage)$/.test(c.method));
+  };
+
+  await t('toggling an alert chain no longer switches the active trading chain', async () => {
+    await db.getOrCreateUser(801, 'chainbug');
+    await db.updateUser(801, { active_chain: 'robinhood', alert_chains: 'solana,robinhood' });
+    await tap(801, 'alertchain_solana');
+    const u = await db.getUser(801);
+    eq(u.active_chain, 'robinhood', 'active chain');
+    eq(u.alert_chains, 'robinhood', 'alert chains');
+  });
+
+  await t('every panel renders and edits in place without error', async () => {
+    await db.getOrCreateUser(777, 'admin');
+    for (const data of ['p:home', 'p:pos', 'p:pnl', 'p:lb:7:all', 'p:lb:0:solana', 'p:lb:1:robinhood',
+      'p:hit:30', 'p:hit:0', 'p:pat', 'p:alerts', 'p:set', 'p:watch', 'p:ref', 'p:help', 'p:admin',
+      'p:wallet', 'p:sellall', 'p:posd:999999', 'nav_leaderboard', 'lb_9999']) {
+      const sent = await tap(777, data);
+      if (errors.length) throw new Error(`${data}: ${errors.join('; ')}`);
+      if (!sent) throw new Error(`${data}: nothing rendered`);
+      if (sent.method !== 'editMessageText') throw new Error(`${data}: sent a new message instead of editing`);
+      if (sent.payload.text.length > 4096) throw new Error(`${data}: ${sent.payload.text.length} chars`);
+      for (const row of sent.payload.reply_markup.inline_keyboard) {
+        for (const b of row) if (b.callback_data && Buffer.byteLength(b.callback_data) > 64) throw new Error(`${data}: callback too long ${b.callback_data}`);
+      }
+    }
+  });
+
+  await t('the leaderboard panel shows the call with its alert score and a working period switch', async () => {
+    const sent = await tap(777, 'p:lb:30:solana');
+    if (!/BOOM/.test(sent.payload.text)) throw new Error('BOOM missing');
+    if (!/💀/.test(sent.payload.text)) throw new Error('rug status missing');
+    if (/QUIET/.test(sent.payload.text)) throw new Error('un-alerted token shown');
+    const periodRow = sent.payload.reply_markup.inline_keyboard[0].map(b => b.text).join(' ');
+    if (!/• 30d/.test(periodRow)) throw new Error(`selection marker: ${periodRow}`);
+  });
+
+  await t('settings buttons re-render the panel with the new value selected', async () => {
+    await db.updateUser(777, { active_chain: 'solana', max_buy_amount: 0.1 });
+    const sent = await tap(777, 'setbuy_0.5');
+    eq((await db.getUser(777)).max_buy_amount, 0.5, 'saved');
+    if (!/• 0\.5/.test(JSON.stringify(sent.payload.reply_markup))) throw new Error('marker did not move');
+  });
+  Telegram.prototype.callApi = realCallApi;
+}
+
 (async () => {
   await db.init();
   await positionAccounting();
@@ -627,6 +790,7 @@ async function robustness() {
   await calibration();
   await pipelineAndAlerts();
   await robustness();
+  await trackRecordAndPanels();
   console.log(`\n${pass} passed, ${fail} failed`);
   await db.pool.end();
   process.exit(fail ? 1 : 0);

@@ -178,7 +178,18 @@ async function migrate(client) {
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS lp_unlocked_pct DOUBLE PRECISION;
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS liquidity_usd DOUBLE PRECISION;
     ALTER TABLE tokens ADD COLUMN IF NOT EXISTS sell_tax_pct DOUBLE PRECISION;
+    -- Track record. A call is measured from the price when it was ALERTED,
+    -- with the score the user actually saw — not the latest re-check score.
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS alerted_at TIMESTAMPTZ;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS alert_score INTEGER;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS alert_mc DOUBLE PRECISION;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS base_price_usd DOUBLE PRECISION;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS base_mc DOUBLE PRECISION;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS peak_mc DOUBLE PRECISION;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS peak_at TIMESTAMPTZ;
+    ALTER TABLE tokens ADD COLUMN IF NOT EXISTS last_multiple DOUBLE PRECISION;
   `);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_tokens_alerted ON tokens(alerted_at) WHERE alerted`);
 
   // The old tokens table had UNIQUE(mint) only. Two chains can theoretically
   // collide, so widen it to (chain, mint).
@@ -254,6 +265,18 @@ async function migrate(client) {
       sent_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(user_id, chain, mint, kind)
     );
+  `);
+
+  // Backfill when each already-alerted token was first called, and at what
+  // score, from the per-user alert log. Idempotent: only fills NULLs.
+  await client.query(`
+    UPDATE tokens t SET alerted_at = a.first_at, alert_score = COALESCE(t.alert_score, a.score)
+    FROM (
+      SELECT chain, mint, MIN(sent_at) AS first_at,
+             (array_agg(score ORDER BY sent_at))[1] AS score
+      FROM alerts_sent WHERE kind = 'new_token' GROUP BY chain, mint
+    ) a
+    WHERE t.alerted_at IS NULL AND t.chain = a.chain AND t.mint = a.mint
   `);
 
   logger.info('Migrations applied');
@@ -378,14 +401,72 @@ async function getToken(chain, mint) {
   return rows[0];
 }
 
-async function markTokenAlerted(chain, mint) {
-  await pool.query(`UPDATE tokens SET alerted = TRUE WHERE chain=$1 AND mint=$2`, [chain, mint]);
+// The first alert fixes the call: when, at what score and market cap. Later
+// re-check alerts must not move it, or every call would look like it was
+// made at the bottom.
+async function markTokenAlerted(chain, mint, { score = null, marketCap = null } = {}) {
+  await pool.query(
+    `UPDATE tokens SET alerted = TRUE,
+       alerted_at = COALESCE(alerted_at, NOW()),
+       alert_score = COALESCE(alert_score, $3),
+       alert_mc = COALESCE(alert_mc, $4)
+     WHERE chain=$1 AND mint=$2`,
+    [chain, mint, score, marketCap]
+  );
 }
 
 async function getTokensToTrack() {
   const { rows } = await pool.query(
-    `SELECT chain, mint, symbol, initial_mc, score FROM tokens
+    `SELECT chain, mint, symbol, initial_mc, score, alerted_at FROM tokens
      WHERE tracking_until IS NOT NULL AND tracking_until > NOW()`
+  );
+  return rows;
+}
+
+/**
+ * Base, peak and latest price for a token, from its own snapshots.
+ *
+ * Two rules keep the multiple honest:
+ *  - One price source only. DexScreener snapshots (they carry liquidity) and
+ *    swap-quote snapshots (they don't) disagree by large factors on a fresh
+ *    pool; dividing one by the other produced fake 5-50x "runners". Once a
+ *    token is indexed only DexScreener prices count.
+ *  - The base is the first price at or after the alert, not before it, and a
+ *    peak printed on dust liquidity does not count.
+ */
+async function getPriceStats(chain, mint, { since = null, minPeakLiqUsd = 1000 } = {}) {
+  const { rows } = await pool.query(
+    `WITH s AS (
+       SELECT price_usd, market_cap, liquidity_usd, taken_at, (liquidity_usd IS NOT NULL) AS dex
+       FROM token_snapshots
+       WHERE chain = $1 AND mint = $2 AND price_usd > 0
+         AND ($3::timestamptz IS NULL OR taken_at >= $3::timestamptz - interval '1 minute')
+     ), pick AS (
+       SELECT * FROM s WHERE dex = (SELECT COALESCE(bool_or(dex), FALSE) FROM s)
+     )
+     SELECT
+       (SELECT COUNT(*)::int FROM pick) AS n,
+       (SELECT COALESCE(bool_or(dex), FALSE) FROM s) AS dex,
+       (SELECT row_to_json(x) FROM (SELECT price_usd, market_cap, taken_at FROM pick
+          ORDER BY taken_at ASC LIMIT 1) x) AS base,
+       (SELECT row_to_json(x) FROM (SELECT price_usd, market_cap, taken_at FROM pick
+          WHERE liquidity_usd IS NULL OR liquidity_usd >= $4
+          ORDER BY price_usd DESC, taken_at ASC LIMIT 1) x) AS peak,
+       (SELECT row_to_json(x) FROM (SELECT price_usd, market_cap, liquidity_usd, taken_at FROM pick
+          ORDER BY taken_at DESC LIMIT 1) x) AS last`,
+    [chain, mint, since, minPeakLiqUsd]
+  );
+  return rows[0];
+}
+
+// Tokens whose stored multiple predates getPriceStats (computed against a
+// sliding base). Recomputed once from their snapshots, no RPC involved.
+async function getTokensNeedingRebase(limit = 2000) {
+  const { rows } = await pool.query(
+    `SELECT chain, mint, alerted_at FROM tokens
+     WHERE peak_multiple IS NOT NULL AND base_price_usd IS NULL
+     ORDER BY detected_at DESC LIMIT $1`,
+    [limit]
   );
   return rows;
 }
@@ -617,70 +698,166 @@ async function recordAlert(userId, chain, mint, score, kind = 'new_token') {
   return rows[0];
 }
 
-// Hit rate by score band — tells us whether the thesis engine is actually right.
-async function getScoreBandPerformance() {
-  const { rows } = await pool.query(`
-    SELECT
-      CASE
-        WHEN score >= 85 THEN '85-100'
-        WHEN score >= 70 THEN '70-84'
-        WHEN score >= 55 THEN '55-69'
-        ELSE '0-54'
-      END AS band,
-      COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE peak_multiple >= 2)::int AS hit_2x,
-      COUNT(*) FILTER (WHERE peak_multiple >= 5)::int AS hit_5x,
-      COUNT(*) FILTER (WHERE outcome = 'rug')::int AS rugs,
-      ROUND(AVG(peak_multiple)::numeric, 2) AS avg_peak
-    FROM tokens
-    WHERE score IS NOT NULL AND peak_multiple IS NOT NULL
-    GROUP BY band ORDER BY band DESC
-  `);
-  return rows;
+// ---------------------------------------------------------- track record
+
+// Window + chain filter shared by every track-record query. `days` 0 = all
+// time. Parameters are appended to `params` so callers can add their own.
+function callFilter(params, { days = 0, chain = null } = {}) {
+  const clauses = [];
+  if (days > 0) {
+    params.push(days);
+    clauses.push(`COALESCE(alerted_at, detected_at) > NOW() - ($${params.length} || ' days')::interval`);
+  }
+  if (chain) {
+    params.push(chain);
+    clauses.push(`chain = $${params.length}`);
+  }
+  return clauses.length ? `AND ${clauses.join(' AND ')}` : '';
 }
 
-async function getLeaderboard(days, limit = 20) {
-  const where = days
-    ? `AND detected_at > NOW() - ('${parseInt(days, 10)} days')::interval`
-    : '';
+/**
+ * Best calls the bot actually made — tokens that were alerted to someone,
+ * ranked by peak multiple since the alert. Runners that later rugged stay on
+ * the board (the call was still right; the outcome column says what came
+ * next) instead of vanishing.
+ */
+async function getLeaderboard({ days = 7, chain = null, limit = 10 } = {}) {
+  const params = [];
+  const filter = callFilter(params, { days, chain });
+  params.push(limit);
   const { rows } = await pool.query(
-    `SELECT chain, mint, symbol, score, initial_mc, peak_price_usd, peak_multiple, outcome, detected_at
+    `SELECT chain, mint, symbol, COALESCE(alert_score, score) AS score,
+            COALESCE(base_mc, alert_mc, initial_mc) AS call_mc,
+            COALESCE(peak_mc, COALESCE(base_mc, alert_mc, initial_mc) * peak_multiple) AS peak_mc,
+            peak_multiple, last_multiple, outcome, peak_at,
+            COALESCE(alerted_at, detected_at) AS called_at
      FROM tokens
-     WHERE peak_multiple IS NOT NULL AND peak_multiple > 1
-       AND (outcome IS NULL OR outcome != 'rug')
-       ${where}
-     ORDER BY peak_multiple DESC
-     LIMIT $1`,
-    [limit]
+     WHERE alerted AND peak_multiple IS NOT NULL AND peak_multiple > 1
+       ${filter}
+     ORDER BY peak_multiple DESC, called_at DESC
+     LIMIT $${params.length}`,
+    params
   );
   return rows;
 }
 
-async function getPatternAnalysis(minMultiple = 5, days = 30) {
+/** Headline numbers for the same window: how many calls, how many paid. */
+async function getCallStats({ days = 7, chain = null } = {}) {
+  const params = [];
+  const filter = callFilter(params, { days, chain });
+  const { rows } = await pool.query(
+    `SELECT
+       COUNT(*)::int AS calls,
+       COUNT(*) FILTER (WHERE peak_multiple IS NOT NULL)::int AS measured,
+       COUNT(*) FILTER (WHERE peak_multiple >= 2)::int AS hit_2x,
+       COUNT(*) FILTER (WHERE peak_multiple >= 5)::int AS hit_5x,
+       COUNT(*) FILTER (WHERE outcome = 'rug')::int AS rugs,
+       MAX(peak_multiple) AS best,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY peak_multiple)
+         FILTER (WHERE peak_multiple IS NOT NULL) AS median_peak
+     FROM tokens
+     WHERE alerted ${filter}`,
+    params
+  );
+  return rows[0];
+}
+
+// Hit rate by score band — tells us whether the thesis engine is actually
+// right. Bands follow the scorer's own thresholds: 75+ needs momentum, the
+// 60s are clean launches, 40-59 is the floor band.
+async function getScoreBandPerformance({ days = 30, chain = null } = {}) {
+  const params = [];
+  const filter = callFilter(params, { days, chain });
+  const { rows } = await pool.query(`
+    SELECT band, COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE peak_multiple >= 2)::int AS hit_2x,
+      COUNT(*) FILTER (WHERE peak_multiple >= 5)::int AS hit_5x,
+      COUNT(*) FILTER (WHERE outcome = 'rug')::int AS rugs,
+      ROUND(AVG(peak_multiple)::numeric, 2) AS avg_peak,
+      ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY peak_multiple))::numeric, 2) AS median_peak
+    FROM (
+      SELECT *, CASE
+        WHEN COALESCE(alert_score, score) >= 75 THEN '75-100'
+        WHEN COALESCE(alert_score, score) >= 60 THEN '60-74'
+        WHEN COALESCE(alert_score, score) >= 40 THEN '40-59'
+        ELSE '0-39'
+      END AS band
+      FROM tokens
+      WHERE score IS NOT NULL AND peak_multiple IS NOT NULL ${filter}
+    ) b
+    GROUP BY band ORDER BY band DESC
+  `, params);
+  return rows;
+}
+
+// What winners looked like at detection vs everything tracked. Liquidity is
+// compared in USD: liquidity_sol holds SOL on Solana and ETH on Robinhood,
+// so averaging it across chains was meaningless.
+async function getPatternAnalysis(minMultiple = 3, days = 30) {
   const { rows } = await pool.query(
     `SELECT
        COUNT(*)::int AS total,
        COUNT(*) FILTER (WHERE peak_multiple >= $1)::int AS winners,
-       ROUND(AVG(score)::numeric, 1) AS avg_score,
-       ROUND(AVG(score) FILTER (WHERE peak_multiple >= $1)::numeric, 1) AS avg_score_winners,
+       ROUND(AVG(COALESCE(alert_score, score))::numeric, 1) AS avg_score,
+       ROUND((AVG(COALESCE(alert_score, score)) FILTER (WHERE peak_multiple >= $1))::numeric, 1) AS avg_score_winners,
        ROUND(AVG(initial_mc)::numeric, 0) AS avg_mc,
-       ROUND(AVG(initial_mc) FILTER (WHERE peak_multiple >= $1)::numeric, 0) AS avg_mc_winners,
-       ROUND(AVG(liquidity_sol)::numeric, 2) AS avg_liq,
-       ROUND(AVG(liquidity_sol) FILTER (WHERE peak_multiple >= $1)::numeric, 2) AS avg_liq_winners,
+       ROUND((AVG(initial_mc) FILTER (WHERE peak_multiple >= $1))::numeric, 0) AS avg_mc_winners,
+       ROUND(AVG(liquidity_usd)::numeric, 0) AS avg_liq,
+       ROUND((AVG(liquidity_usd) FILTER (WHERE peak_multiple >= $1))::numeric, 0) AS avg_liq_winners,
        ROUND(AVG(holder_count)::numeric, 0) AS avg_holders,
-       ROUND(AVG(holder_count) FILTER (WHERE peak_multiple >= $1)::numeric, 0) AS avg_holders_winners,
+       ROUND((AVG(holder_count) FILTER (WHERE peak_multiple >= $1))::numeric, 0) AS avg_holders_winners,
        ROUND(AVG(dev_holding_pct)::numeric, 1) AS avg_dev_pct,
-       ROUND(AVG(dev_holding_pct) FILTER (WHERE peak_multiple >= $1)::numeric, 1) AS avg_dev_pct_winners,
+       ROUND((AVG(dev_holding_pct) FILTER (WHERE peak_multiple >= $1))::numeric, 1) AS avg_dev_pct_winners,
        ROUND(100.0 * COUNT(*) FILTER (WHERE mint_authority_revoked AND peak_multiple >= $1) /
          NULLIF(COUNT(*) FILTER (WHERE peak_multiple >= $1), 0)::numeric, 0) AS pct_mint_revoked_winners,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mint_authority_revoked) /
+         NULLIF(COUNT(*), 0)::numeric, 0) AS pct_mint_revoked_all,
        ROUND(100.0 * COUNT(*) FILTER (WHERE lp_burned_pct > 80 AND peak_multiple >= $1) /
          NULLIF(COUNT(*) FILTER (WHERE peak_multiple >= $1), 0)::numeric, 0) AS pct_lp_burned_winners,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mint_authority_revoked) /
-         NULLIF(COUNT(*), 0)::numeric, 0) AS pct_mint_revoked_all
+       ROUND(100.0 * COUNT(*) FILTER (WHERE lp_burned_pct > 80) /
+         NULLIF(COUNT(*), 0)::numeric, 0) AS pct_lp_burned_all,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE outcome = 'rug') /
+         NULLIF(COUNT(*), 0)::numeric, 0) AS pct_rug_all
      FROM tokens
-     WHERE score IS NOT NULL
+     WHERE score IS NOT NULL AND peak_multiple IS NOT NULL
        AND detected_at > NOW() - ($2 || ' days')::interval`,
     [minMultiple, days]
+  );
+  return rows[0];
+}
+
+// ---------------------------------------------------------------- panels
+
+async function getPosition(userId, id) {
+  const { rows } = await pool.query(`SELECT * FROM positions WHERE user_id=$1 AND id=$2`, [userId, id]);
+  return rows[0];
+}
+
+// Realised PnL per chain. Each chain's PnL is in its own native currency, so
+// they are never summed together.
+async function getUserPnlByChain(userId) {
+  const { rows } = await pool.query(
+    `SELECT chain,
+       COUNT(*)::int AS trades,
+       COUNT(*) FILTER (WHERE pnl_sol > 0)::int AS wins,
+       COALESCE(SUM(pnl_sol), 0)::float AS pnl,
+       COALESCE(SUM(sol_invested), 0)::float AS invested,
+       MAX(pnl_pct)::float AS best_pct,
+       MIN(pnl_pct)::float AS worst_pct
+     FROM positions WHERE user_id = $1 AND status = 'closed'
+     GROUP BY chain ORDER BY chain`,
+    [userId]
+  );
+  return rows;
+}
+
+async function getReferralStats(userId) {
+  const { rows } = await pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM users WHERE referrer_id = $1) AS referred,
+       (SELECT COALESCE(SUM(referrer_share), 0)::float FROM fee_ledger WHERE referrer_id = $1) AS earned,
+       (SELECT COALESCE(SUM(referrer_share), 0)::float FROM fee_ledger WHERE referrer_id = $1 AND NOT paid_out) AS unpaid`,
+    [userId]
   );
   return rows[0];
 }
@@ -696,5 +873,7 @@ module.exports = {
   addWatchedWallet, removeWatchedWallet, getWatchedWallets,
   recordWalletActivity, countWatchersBought, getWalletsBought,
   wasAlerted, recordAlert, getScoreBandPerformance,
-  getLeaderboard, getPatternAnalysis,
+  getPriceStats, getTokensNeedingRebase,
+  getLeaderboard, getCallStats, getPatternAnalysis,
+  getPosition, getUserPnlByChain, getReferralStats,
 };
